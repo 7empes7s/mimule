@@ -3,6 +3,8 @@ paperclip-action-notify.env
 openclaw-data/
 openclaw-config/openclaw.json
 openclaw-config/exec-approvals.json
+openclaw-config/agents/main/sessions/
+openclaw-config/identity/
 openclaw-config/logs/
 openclaw-config/media/
 openclaw-config/telegram/
@@ -15,3 +17,5 @@ openclaw-config/canvas/
 projects/
 docker-compose.yml.save
 *.log
+openclaw-config/workspace/.openclaw/
+openclaw-config/workspace/MASTER_PLAN.md
