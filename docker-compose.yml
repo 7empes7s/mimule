@@ -1,0 +1,46 @@
+services:
+  openclaw-gateway:
+    build:
+      context: /opt/mimoun
+      dockerfile: openclaw-gateway.Dockerfile
+    image: mimule/openclaw-gateway:local
+    container_name: openclaw_gateway
+    working_dir: /root
+    command: ["sh", "/opt/start-openclaw.sh"]
+    ports:
+      - "127.0.0.1:18789:18789"
+    env_file:
+      - .env
+    environment:
+      OPENCLAW_GATEWAY_PORT: "18789"
+      OPENCLAW_SERVICE_KIND: "gateway"
+      NODE_COMPILE_CACHE: "/var/tmp/openclaw-compile-cache"
+      HOME: "/root"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - /home/agent:/home/agent
+      - /opt/mimoun:/opt/mimoun
+      - /opt/newsbites:/opt/newsbites
+      - /opt/mimoun/openclaw-config:/root/.openclaw
+      - /root/.claude:/root/.claude:ro
+      - /root/.codex:/root/.codex:ro
+      - /opt/mimoun/start-openclaw.sh:/opt/start-openclaw.sh:ro
+      - /usr/lib/node_modules:/usr/lib/node_modules:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - mimoun_npm_global:/usr/local/lib/node_modules
+      - acpx_data:/root/.acpx
+    restart: unless-stopped
+  goblin-game:
+    image: nginx:alpine
+    container_name: goblin_game
+    ports:
+      - "127.0.0.1:9000:80"
+    volumes:
+      - ./projects/goblin-goldmine:/usr/share/nginx/html:ro
+    restart: unless-stopped
+volumes:
+  acpx_data:
+    name: mimoun_acpx_data
+  mimoun_npm_global:
+    external: true

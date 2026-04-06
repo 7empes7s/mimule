@@ -1,0 +1,10 @@
+[Unit]
+Description=Paperclip actionable-item Telegram notifier
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+EnvironmentFile=/opt/mimoun/paperclip-action-notify.env
+ExecStart=/opt/mimoun/openclaw-config/scripts/paperclip-attention.sh notify

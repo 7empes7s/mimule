@@ -1,0 +1,17 @@
+.env
+paperclip-action-notify.env
+openclaw-data/
+openclaw-config/openclaw.json
+openclaw-config/exec-approvals.json
+openclaw-config/logs/
+openclaw-config/media/
+openclaw-config/telegram/
+openclaw-config/update-check.json
+openclaw-config/delivery-queue/
+openclaw-config/tasks/
+openclaw-config/costs/
+openclaw-config/devices/
+openclaw-config/canvas/
+projects/
+docker-compose.yml.save
+*.log

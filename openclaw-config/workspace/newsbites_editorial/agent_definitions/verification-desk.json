@@ -1,0 +1,24 @@
+{
+  "name": "Verification Desk",
+  "role": "general",
+  "title": "Fact Verification Lead",
+  "reportsTo": null,
+  "capabilities": "Independent claim checking, contradiction review, high-risk wording review, third-pass research for sensitive NewsBites stories",
+  "adapterType": "codex_local",
+  "adapterConfig": {
+    "cwd": "/opt/mimoun/openclaw-config/workspace/newsbites_editorial",
+    "model": "gpt-5.3-codex",
+    "dangerouslyBypassApprovalsAndSandbox": true
+  },
+  "runtimeConfig": {
+    "heartbeat": {
+      "enabled": false,
+      "wakeOnDemand": true
+    }
+  },
+  "budgetMonthlyCents": 700,
+  "metadata": {
+    "newsbitesRole": "verification-desk",
+    "scope": "editorial-verification"
+  }
+}

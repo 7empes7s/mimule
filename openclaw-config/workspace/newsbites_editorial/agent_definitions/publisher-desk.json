@@ -1,0 +1,24 @@
+{
+  "name": "Publisher Desk",
+  "role": "general",
+  "title": "Publication Packager",
+  "reportsTo": null,
+  "capabilities": "Digest generation, publish checklist preparation, social/email/TTS packaging derived from verified NewsBites articles",
+  "adapterType": "codex_local",
+  "adapterConfig": {
+    "cwd": "/opt/mimoun/openclaw-config/workspace/newsbites_editorial",
+    "model": "gpt-5.3-codex",
+    "dangerouslyBypassApprovalsAndSandbox": true
+  },
+  "runtimeConfig": {
+    "heartbeat": {
+      "enabled": false,
+      "wakeOnDemand": true
+    }
+  },
+  "budgetMonthlyCents": 400,
+  "metadata": {
+    "newsbitesRole": "publisher-desk",
+    "scope": "editorial-packaging"
+  }
+}

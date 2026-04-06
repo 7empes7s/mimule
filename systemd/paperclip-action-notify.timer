@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Paperclip actionable-item notifier every 2 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=30s
+Unit=paperclip-action-notify.service
+
+[Install]
+WantedBy=timers.target
