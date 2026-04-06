@@ -1,0 +1,60 @@
+{
+  "meta": {
+    "lastTouchedAt": "2026-04-05T20:00:00Z"
+  },
+  "gateway": {
+    "mode": "local",
+    "port": 18789,
+    "auth": {
+      "mode": "token"
+    },
+    "controlUi": {
+      "allowedOrigins": [
+        "https://mimoun.techinsiderbytes.com",
+        "http://178.104.120.71:18789"
+      ],
+      "dangerouslyAllowHostHeaderOriginFallback": true
+    }
+  },
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "accounts": {
+        "default": {
+          "botToken": "[REDACTED-TELEGRAM-BOT-TOKEN]",
+          "dmPolicy": "allowlist",
+          "allowFrom": [
+            7783532877
+          ]
+        }
+      },
+      "capabilities": {
+        "inlineButtons": "all"
+      },
+      "streaming": "partial",
+      "errorPolicy": "always"
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": "google/gemini-2.5-flash"
+    }
+  },
+  "approvals": {
+    "exec": {
+      "enabled": true,
+      "mode": "targets",
+      "targets": [
+        {
+          "channel": "telegram",
+          "to": "7783532877"
+        }
+      ]
+    }
+  },
+  "tools": {
+    "exec": {
+      "ask": "on-miss"
+    }
+  }
+}
