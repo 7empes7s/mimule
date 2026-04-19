@@ -1889,3 +1889,119 @@ NEXT:
 - Resume leveling plan execution: Week 2 (Phases 3+4 — sports panel fetcher + StandingsTable + FixturesCard)
 - Requires `FOOTBALL_DATA_API_KEY` (free registration at football-data.org)
 - Alternatively, skip to Phase 9 (finance panel migration) which has no new API key requirement
+
+### 2026-04-18 11:15 UTC - Codex CLI
+STATUS:
+- Increased NewsBites autopipeline intake capacity by combining faster scout cadence, broader scout-source coverage, and multi-dossier scout fan-out.
+
+CHANGES:
+- Updated `/opt/mimoun/openclaw-config/workspace/newsbites_editorial/scripts/newsbites-autopipeline.mjs`:
+  - added `SCOUT_FANOUT_COUNT`
+  - added scout-bundle fan-out logic that can spawn multiple dossiers from one deduped scout run
+  - made fan-out prefer vertical diversity first, then fill remaining slots by rank/score
+  - routed spawned items straight to `research`
+  - exposed live tuning in the `stats` response
+- Updated `/etc/default/newsbites-autopipeline`:
+  - `SCOUT_INTERVAL_MS=1800000`
+  - `SCOUT_FANOUT_COUNT=3`
+- Expanded `/opt/mimoun/openclaw-config/workspace/newsbites_editorial/scout_sources.json` with working feeds for `science`, `sports`, `wellness`, `healthcare`, `climate`, `energy`, `crypto`, and a second `culture` source.
+- Reclassified `Nature News` from `healthcare` to `science` to close the missing science lane.
+- Updated `/opt/mimoun/openclaw-config/workspace/newsbites_editorial/OPERATING_MODEL.md` to reflect the live scout cadence and multi-dossier behavior.
+- Documented the change in the AI vault:
+  - `/opt/ai-vault/daily/2026-04-18.md`
+  - `/opt/ai-vault/newsbites/2026-04-18-autopipeline-scout-expansion.md`
+  - `/opt/ai-vault/context/tib-stack.md`
+
+EVIDENCE:
+- Verified live config before change: queue empty, `MAX_CONCURRENT_STORIES=3`, `SCOUT_BRIEF_COUNT=20`, and scout cadence still `7200000` ms.
+- Measured recent scout skew:
+  - published verticals: `global-politics 10`, `ai 9`, `sports 4`, then a long tail
+  - scout candidates: `ai 508`, `global-politics 180`, `culture 35`, others single digits
+- Verified new feed URLs over the network before adding them; working additions included:
+  - NASA News
+  - ScienceDaily
+  - BBC Sport
+  - The Guardian Sport
+  - CDC Healthy Living
+  - CDC Newsroom
+  - Fierce Healthcare
+  - NOAA News
+  - US EIA Press Releases
+  - Cointelegraph
+  - Smithsonian Arts & Culture
+- Excluded candidate feeds that returned `403` or `404` during verification.
+
+NEXT:
+- Restart `newsbites-autopipeline.service` so the new env values are active.
+- Run a fresh scout cycle and confirm one scout bundle now spawns multiple `research` dossiers with broader vertical spread.
+- Watch whether higher intake materially improves non-`ai` / non-`global-politics` publish volume without overwhelming `verify`.
+
+### 2026-04-18 11:52 UTC - Codex CLI
+STATUS:
+- Closed a pipeline completeness gap where successful NewsBites runs could publish without `verify.md`, without `claims.csv` on some dossiers, and without a populated dossier `Publication Log`.
+
+CHANGES:
+- Added `/opt/mimoun/openclaw-config/workspace/newsbites_editorial/scripts/_dossier-artifacts.mjs`:
+  - backfills `claims.csv` from the dossier claim table
+  - generates a clearly marked fallback `verify.md` receipt when verification succeeded but no memo was persisted
+  - updates publication metadata in `DOSSIER.md`
+- Added `/opt/mimoun/openclaw-config/workspace/newsbites_editorial/scripts/repair-dossier-artifacts.mjs` to repair already-published dossiers without re-running the full pipeline
+- Updated `/opt/newsbites/scripts/publish-dossier.mjs` to write dossier publication metadata back into `DOSSIER.md` during publish
+- Confirmed `/opt/mimoun/openclaw-config/workspace/newsbites_editorial/scripts/newsbites-autopipeline.mjs` now:
+  - backfills `claims.csv` and `verify.md` after successful `verify`
+  - fails auto-gate when `verify.md` is missing
+- Documented the guardrail in:
+  - `/opt/ai-vault/daily/2026-04-18.md`
+  - `/opt/ai-vault/newsbites/2026-04-18-autopipeline-scout-expansion.md`
+  - `/opt/ai-vault/context/tib-stack.md`
+
+EVIDENCE:
+- `node --check` passed for:
+  - `/opt/newsbites/scripts/publish-dossier.mjs`
+  - `/opt/mimoun/openclaw-config/workspace/newsbites_editorial/scripts/_dossier-artifacts.mjs`
+  - `/opt/mimoun/openclaw-config/workspace/newsbites_editorial/scripts/repair-dossier-artifacts.mjs`
+  - `/opt/mimoun/openclaw-config/workspace/newsbites_editorial/scripts/newsbites-autopipeline.mjs`
+- Restarted `newsbites-autopipeline.service`; journal shows clean restart at `2026-04-18T11:49:35Z`
+- Repaired these live dossiers:
+  - `unicef-outraged-by-killing-of-gaza-water-truck-drivers-urges-investigation`
+  - `story-of-black-british-music-writ-large-in-first-exhibition-at-v-a-east`
+  - `no-generation-is-safe-from-the-nostalgia-industry-just-look-at-the-disappointing`
+  - `uk-inflation-falls-to-26-in-march-2026-driven-by-lower-energy-prices`
+  - `spot-bitcoin-etfs-attract-nearly-1b-in-weekly-inflows-as-risk-sentiment-improves`
+
+NEXT:
+- Watch the next live scout batch and confirm new dossiers now exit `verify` with `verify.md` present before `auto-gate`
+- Decide later whether to tighten the fallback `verify.md` into a stricter blocker or improve the verifier so it always persists a first-party cite-verify memo
+
+### 2026-04-18 21:10 UTC - Codex CLI
+STATUS:
+- Fixed the dashboard’s false inactive status for autopipeline/model-health and patched the autopipeline to stop repeated Groq-rate-limit spam on the same dossiers.
+
+CHANGES:
+- Updated `/opt/dashboard-v2/src/app/api/infra/route.ts` so the dashboard:
+  - checks unit state via `systemctl show` instead of a bare `is-active`
+  - reports `newsbites-autopipeline.service` directly
+  - treats `model-health-check.service` as healthy when its timer is active and the last run succeeded
+  - returns correct `cpu`/`uptime` fields
+- Updated `/opt/mimoun/openclaw-config/workspace/newsbites_editorial/scripts/newsbites-autopipeline.mjs` so the worker:
+  - deduplicates scout candidates against existing dossier directories plus queue/completed history, not only published articles
+  - rate-limits Telegram failure alerts per `slug + stage + error bucket`
+  - cools down cloud models after `capacity_rate_limit` failures and spreads concurrent cloud work across ranked candidates instead of hammering the same Groq model
+- Rebuilt `dashboard-v2`, restarted `dashboard-v2.service`, and restarted `newsbites-autopipeline.service`
+
+EVIDENCE:
+- `node --check /opt/mimoun/openclaw-config/workspace/newsbites_editorial/scripts/newsbites-autopipeline.mjs` passed
+- `npm run build` passed in `/opt/dashboard-v2`
+- `curl http://127.0.0.1:3004/api/infra` now reports:
+  - `newsbites-autopipeline.service` → `active`
+  - `model-health-check.service` → `active` with `activeState=inactive`, `result=success` (timer-backed oneshot interpreted correctly)
+- `systemctl status newsbites-autopipeline.service` shows a clean restart at `2026-04-18 21:08:22 UTC`
+- `curl http://127.0.0.1:3200/queue` now returns an empty queue after restart
+- Runtime state before the fix showed repeated stuck duplicates for the same slugs in `/var/lib/mimule/pipeline-state.json`, including:
+  - `independent-group-energy-for-australians-that-ran-anti-labor-ads-received-more-t`
+  - `from-smelters-to-servers-alcoa-to-cash-in-on-cryptos-thirst-for-energy`
+  - `howes-biggest-newcastle-challenge-yet-can-he-survive`
+
+NEXT:
+- Watch the next auto-scout cycle and confirm previously-seen dossiers are skipped instead of being respawned
+- If Groq TPM limits still dominate after cooldown/diversification, lower `MAX_CONCURRENT_STORIES` or bias `bestCloudHeavy` away from Groq in the model-health ranking logic
