@@ -2005,3 +2005,239 @@ EVIDENCE:
 NEXT:
 - Watch the next auto-scout cycle and confirm previously-seen dossiers are skipped instead of being respawned
 - If Groq TPM limits still dominate after cooldown/diversification, lower `MAX_CONCURRENT_STORIES` or bias `bestCloudHeavy` away from Groq in the model-health ranking logic
+
+### 2026-05-07 19:16 UTC - Codex CLI
+STATUS:
+- Reviewed Dashboard V4 plan additions and made additive-only planning fixes while preserving Claude's existing changes.
+
+CHANGES:
+- Updated `/root/DASHBOARD_V4_PLAN.md`:
+  - added a code-verified review addendum for Claude's route cleanup, current typecheck failures, token vending, fail-open auth, missing doctor scan route, and in-memory deploy jobs
+  - extended the action descriptor contract with impact preview, rollback hint, expected duration, job kind, source route, and online requirement
+  - expanded `action_audit` and `jobs` schemas so reason, risk, evidence, actor source, job/event links, cancellation, and retry state can be persisted
+  - added action descriptor/action registry/workspace file/workspace diff API entries
+  - sharpened Phase 0 tasks with exact current files and preservation notes
+- Updated `/root/DASHBOARD_V3_PLAN.md` with additive correction notes for stale missing-package, missing-route, and missing-adapter-capability sections. Nothing was removed.
+- Updated AI Vault logs:
+  - `/opt/ai-vault/daily/2026-05-07.md`
+  - `/opt/ai-vault/projects/2026-05-07-dashboard-v3-redesign.md`
+
+EVIDENCE:
+- Confirmed `.loading-dim.error` exists in `/opt/opencode-control-surface/app/globals.css`.
+- Re-ran `bun run typecheck` in `/opt/opencode-control-surface`; it still fails in `ChatView`, `ConnectionScreen`, `Layout`, and `SessionListPanel`.
+- Confirmed `server/api/router.ts` still exposes `GET /api/config`; `server/api/actions.ts` still fails open when `OPERATOR_TOKEN` is unset; `POST /api/doctor/scan` is not registered; deploy jobs are stored in an in-memory `Map`.
+- `git diff --check -- DASHBOARD_V4_PLAN.md DASHBOARD_V3_PLAN.md` passed.
+
+NEXT:
+- Start Dashboard V4 Phase 0 implementation: repair legacy OpenCode typecheck drift, remove token vending, make production mutation auth fail closed, and move deploy jobs toward durable SQLite-backed jobs.
+
+### 2026-05-07 UTC - Claude Code
+STATUS:
+- Reviewed and fixed DASHBOARD_V4_PLAN.md — repaired structural issues, added missing functionalities, no content removed.
+
+CHANGES:
+- Updated `/root/DASHBOARD_V4_PLAN.md` (2200→2291 lines):
+  - IA route table: added 5 missing routes (/channels, /litellm, /paperclip, /reports, /content-health) directly into the main table (kept separate stanza).
+  - ActionDescriptor kind: added `"copy-command"`, `"export"`, `"preview"` to the union type — needed for Reports, Knowledge, and fallback "copy command" actions.
+  - events table: added `status text not null default 'open'`, `mitigated_at`, `closed_at` to support all 6 incident lifecycle states.
+  - metric_samples table: fixed nullable columns in composite PK (`entity_type`/`entity_id` now `not null default ''`) — SQLite NULLs in PK columns are problematic.
+  - jobs table: added `max_retries integer not null default 3` and `retry_count integer not null default 0` to prevent runaway retry loops.
+  - Backend API Additions: added 26 missing endpoints covering source-reliability detection, settings state, workspace session resume/output, article approve/promote/batch-approve, report download/send, knowledge detail/export, notification rules CRUD, runbooks CRUD, infra vast-reconcile/backup-verify/restore-drill/backup-status.
+  - Home section: fixed "per-user local state" → "per-operator-session state (operator_state keyed by last_visit_ts)".
+  - Added new **Settings V4** section (was listed in IA but had no content).
+  - /agents section: added clarification of relationship between /agents summary rows and /paperclip full domain.
+  - Version Cut Lines: V4.1 now explicitly includes Phase 9 detection systems (Queue Health, Disk Growth, Rate Limit, Infrastructure Anomaly), /litellm, /channels, /paperclip, doctor-log rotation. V4.2 now explicitly includes Cost Anomaly, Content Health + /content-health, /reports.
+  - V4.0 Additional gates: added note that Phase 9 items there are V4.1 gates — prevents implementation confusion.
+  - Phase 2 tasks: added /settings route and operator_state API as deliverables.
+  - Phase 8 tasks: added /knowledge route (read-only vault notes + handoff packet) and complete /settings route.
+  - Phase 9: added version mapping note (V4.1 vs V4.2 split).
+  - Open Question #1: added recommended answer (separate dashboard-ingestor.service).
+
+EVIDENCE:
+- File integrity: wc -l shows 2291 lines, tail shows Research References intact, all edits verified via grep.
+- No content removed — all original text preserved.
+
+NEXT:
+- Start V4 Phase 0 implementation: fix OpenCode typecheck drift in ChatView/ConnectionScreen/Layout/SessionListPanel, remove /api/config token vending, make checkToken() fail closed in production.
+
+### 2026-05-09 10:11 UTC - Codex CLI
+STATUS:
+- Fixed Claude Code launch from the root-backed control surface without using the CLI flag that Claude blocks under UID 0.
+
+CHANGES:
+- Updated `/opt/opencode-control-surface/server/api/claude.ts` to launch Claude with `--permission-mode dontAsk` instead of `--dangerously-skip-permissions`.
+- Updated `/root/.claude/settings.json` so root Claude sessions default to `dontAsk` rather than `bypassPermissions`.
+- Restarted `control-surface.service`.
+
+EVIDENCE:
+- Reproduced the blocker: `--dangerously-skip-permissions cannot be used with root/sudo privileges for security reasons`.
+- Confirmed `claude -p ... --permission-mode dontAsk` works under `/root`, including a Bash tool call that returned `TOOL_OK`.
+- `bun run typecheck` passed in `/opt/opencode-control-surface`.
+- `bun run build` passed in `/opt/opencode-control-surface` with only the existing large chunk warning.
+- `GET http://127.0.0.1:3000/api/claude/health` returned `ok: true`, version `2.1.138`.
+- End-to-end API stream test via `/api/claude/sessions/:id/stream` returned `API_OK` and `done: ok true`.
+
+NEXT:
+- For true `bypassPermissions`, run Claude as a non-root service user; Claude 2.1.138 explicitly refuses that dangerous mode under root.
+
+### 2026-05-09 10:42 UTC - Codex CLI
+STATUS:
+- Continued Dashboard V4 agent-pages planning from the last Claude Code session and saved the plan Claude could not write.
+
+CHANGES:
+- Added `/root/DASHBOARD_V4_AGENT_PAGES_PLAN.md`.
+- Updated `/root/DASHBOARD_V4_PLAN.md` with an agent-pages addendum.
+- Updated AI Vault logs:
+  - `/opt/ai-vault/daily/2026-05-09.md`
+  - `/opt/ai-vault/projects/2026-05-07-dashboard-v3-redesign.md`
+
+EVIDENCE:
+- Parsed `/root/.claude/projects/-root/4c7b5f54-eb81-4bb4-b57d-a73c8a30f050.jsonl`.
+- Confirmed Claude prepared an inline agent-pages plan, then failed to answer Marouane's follow-up because Claude returned a 429 usage-limit message: `You're out of extra usage - resets 11:10am (UTC)`.
+- Confirmed dynamic skill sources exist for Claude, Codex, shared skills, and OpenCode repo skills.
+
+NEXT:
+- Implement first agent-pages bundle: `server/api/agents.ts` dynamic discovery, shared `AgentComposer`, slash/skill picker, cwd-aware quick prompts, and manual AI Vault logging.
+
+### 2026-05-09 11:05 UTC - Codex CLI
+STATUS:
+- Expanded Dashboard V4 agent-pages plan with researched Claude/Codex/OpenCode feature and action backlog.
+
+CHANGES:
+- Updated `/root/DASHBOARD_V4_AGENT_PAGES_PLAN.md` with:
+  - research addendum for current Claude, Codex, and OpenCode capabilities
+  - shared and per-agent action catalogs
+  - stack-specific quick actions
+  - capability drawer, context picker, run governance bar, and result next-action requirements
+  - new phases for MCP/provider/hooks/agents admin and cloud/review/PR workflows
+  - research references
+- Updated `/root/DASHBOARD_V4_PLAN.md` agent-pages addendum.
+- Updated AI Vault logs:
+  - `/opt/ai-vault/daily/2026-05-09.md`
+  - `/opt/ai-vault/projects/2026-05-07-dashboard-v3-redesign.md`
+
+EVIDENCE:
+- Ran local CLI/subcommand help for Claude, Codex, and OpenCode.
+- Probed OpenCode live model catalog, agent list, session list, and stats.
+- Checked official docs for Claude Code CLI/skills/MCP/subagents/hooks, OpenAI Codex CLI/MCP/app-server/slash commands, and OpenCode CLI/agents.
+
+NEXT:
+- Keep first implementation bundle narrow: dynamic discovery endpoint, shared composer, slash/skill picker, cwd-aware quick prompts, and manual AI Vault logging. Model richer provider-native actions through the action catalog before implementing mutations.
+
+### 2026-05-09 11:48 UTC - Codex CLI
+STATUS:
+- Added a compiled Dashboard V4 phase index including the core dashboard phases, agent-pages phases, and Claude's original agent-pages phase mapping.
+
+CHANGES:
+- Updated `/root/DASHBOARD_V4_PLAN.md` with `Compiled V4 Phase Index`.
+- Updated `/root/DASHBOARD_V4_AGENT_PAGES_PLAN.md` with `Claude Original Phase Mapping`.
+- Updated AI Vault logs:
+  - `/opt/ai-vault/daily/2026-05-09.md`
+  - `/opt/ai-vault/projects/2026-05-07-dashboard-v3-redesign.md`
+
+EVIDENCE:
+- `Compiled V4 Phase Index` now lists Core 0-9 and Agent 0-10.
+- Claude's inline phases are explicitly mapped to current Agent phases.
+
+NEXT:
+- Use the compiled phase index as the roadmap table of contents before implementation work starts.
+
+### 2026-05-09 13:21 UTC - Codex CLI
+STATUS:
+- Started Dashboard V4 agent-pages implementation with a live dynamic discovery layer and capability strip.
+
+CHANGES:
+- Added `/opt/opencode-control-surface/server/api/agents.ts`.
+- Updated `/opt/opencode-control-surface/server/api/router.ts` with:
+  - `GET /api/agents/skills?agent=all|claude|codex|opencode`
+  - `GET /api/agents/discovery`
+- Added `/opt/opencode-control-surface/app/components/AgentDiscoveryStrip.tsx`.
+- Updated `/opt/opencode-control-surface/app/components/OpenCodeView.tsx`, `/opt/opencode-control-surface/app/routes/ClaudePage.tsx`, and `/opt/opencode-control-surface/app/routes/CodexPage.tsx` to render the discovery strip.
+- Updated `/opt/opencode-control-surface/app/globals.css` for the discovery strip.
+- Updated `/opt/opencode-control-surface/app/lib/store.ts` and `/opt/opencode-control-surface/server/index.ts` so `/opencode` serves the dashboard route and the upstream OpenCode API is proxied at `/opencode-api`.
+- Updated AI Vault logs:
+  - `/opt/ai-vault/daily/2026-05-09.md`
+  - `/opt/ai-vault/projects/2026-05-07-dashboard-v3-redesign.md`
+- Restarted `control-surface.service`.
+
+EVIDENCE:
+- `bun run check` passed in `/opt/opencode-control-surface`.
+- `git diff --check` passed for touched files.
+- `control-surface.service` is active.
+- Live `GET http://127.0.0.1:3000/api/agents/discovery` returned 65 skills, 20 commands, Claude/Codex/OpenCode CLI `ok`, 10 OpenCode sessions, 7 OpenCode agents, OpenCode models/stats `ok`, and model/GPU health `ok`.
+- `GET http://127.0.0.1:3000/opencode` returns the control-surface bundle; `GET http://127.0.0.1:3000/opencode-api/session` returns 200.
+
+NEXT:
+- Continue Agent 1: extract a shared `AgentComposer` shell from Claude/Codex/OpenCode pages while preserving current send/stop/resume behavior.
+- Then implement Agent 2: slash/skill picker backed by `/api/agents/skills`.
+
+### 2026-05-09 14:32 UTC - Claude Code (Opus 4.7)
+STATUS:
+- Completed V4 Agent 1 / Phase 1 (Shared Composer Shell). Claude, Codex, and OpenCode pages now share one composer component. Send/stop/resume behavior preserved per page.
+
+CHANGES:
+- Added `/opt/opencode-control-surface/app/components/AgentComposer.tsx` — owns textarea autosize, Enter-to-send, Web Speech voice button, Send/Stop button. `leftButtons` and `aboveRow` slots let OpenCode keep its paperclip + attach chips.
+- Added `/opt/opencode-control-surface/app/hooks/useVoice.ts` — single SpeechRecognition wrapper replacing three duplicates.
+- Edited `app/routes/ClaudePage.tsx` — removed local `useVoice`/`SpeechRec`/`textareaRef`/autosize effect/`handleKeyDown`; renders `<AgentComposer placeholder="Message Claude" … />`.
+- Edited `app/routes/CodexPage.tsx` — same pattern with `placeholder="Message Codex"`.
+- Edited `app/components/OpenCodeView.tsx` — same pattern; `canSubmit={input.trim().length > 0 || attachments.length > 0}` keeps the attachments-only send path; model picker stays in the top bar.
+- Logged session in `/opt/ai-vault/daily/2026-05-09.md` (V4 Agent 1 section).
+- Restarted `control-surface.service`.
+
+EVIDENCE:
+- `bun run check` (`tsc --noEmit && vite build`) clean — `dist/index-*.css 64.75 kB`, `dist/index-*.js 711.41 kB`.
+- `systemctl restart control-surface.service` → active.
+- HTTP smoke: `/`, `/claude`, `/codex`, `/opencode`, `/opencode-api/session` all 200.
+- `POST /api/codex/sessions` (cdx_95f5…) → `GET /api/codex/sessions` lists it → `DELETE` removes it. SSE wiring untouched.
+
+NEXT:
+- Agent 2 — Slash and Skill Picker: `/`-anchored fuzzy-search popover backed by `GET /api/agents/skills`, surfacing skill source/last-modified/risk/agent-compat. Mobile bottom-sheet variant.
+- Cwd-aware quick-prompt strip per agent (Agent 5).
+- Manual AI Vault logging endpoint (`POST /api/vault/append`) and a button on each agent page (Agent 5).
+
+### 2026-05-09 16:11 UTC - Codex CLI
+STATUS:
+- Fixed Dashboard V4 agent-pages stabilization gaps from the review and continued into Agent 2 with a slash/skill picker.
+
+CHANGES:
+- Updated `/opt/opencode-control-surface/server/api/router.ts`, `server/index.ts`, `server/api/claude.ts`, `server/api/codex.ts`, and new `server/api/workspaces.ts`:
+  - Claude/Codex session APIs and the OpenCode proxy now require the operator session/token path.
+  - Claude, Codex, and OpenCode session creation now validate requested working directories against the shared workspace allowlist.
+- Updated `/opt/opencode-control-surface/server/api/agents.ts` and `app/components/AgentDiscoveryStrip.tsx`:
+  - added cheap `GET /api/agents/summary` for the top strip
+  - kept full `GET /api/agents/discovery` for detailed probes
+  - made `GET /api/agents/skills?agent=...` return skills plus CLI/file commands without running the expensive OpenCode model/stats probes
+- Updated `/opt/opencode-control-surface/server/api/stream.ts` to avoid enqueueing into a closed SSE controller after client disconnect.
+- Updated `/opt/opencode-control-surface/app/components/AgentComposer.tsx`, `app/routes/ClaudePage.tsx`, `app/routes/CodexPage.tsx`, `app/components/OpenCodeView.tsx`, and `app/globals.css`:
+  - removed OpenCode's fake disabled Stop control when no stop handler exists
+  - added a `/` picker with quick prompts, discovered skills, CLI commands, source path display, keyboard navigation, and inferred risk labels
+- Updated `/root/DASHBOARD_V4_AGENT_PAGES_PLAN.md`.
+- Restarted `control-surface.service`.
+
+EVIDENCE:
+- `bun run check` passed in `/opt/opencode-control-surface` (`tsc --noEmit && vite build`), with only the existing >500 KB chunk warning.
+- `control-surface.service` is active after restart.
+- `/`, `/claude`, `/codex`, and `/opencode` return HTTP 200.
+- Unauthenticated `/api/codex/sessions` and `/opencode-api/session` return HTTP 401.
+- `GET /api/agents/summary` returned HTTP 200 in ~0.009 s with a ~1.3 KB payload.
+- `GET /api/agents/skills?agent=codex` returned HTTP 200 in ~0.064 s with 48 skills and 20 commands.
+- `/api/stream` disconnect smoke left `control-surface.service` active and did not reproduce the prior closed-controller crash.
+
+NEXT:
+- Continue Agent 5 next for immediate value: cwd-aware quick prompts backed by operator state plus manual AI Vault logging from Claude/Codex/OpenCode sessions.
+- Then move to Agent 3/4 runtime selectors and cost/doctor bar before adding more mutation-heavy provider features.
+
+### 2026-05-09 19:16 UTC - Codex CLI
+STATUS:
+- Rotated the Dashboard V4 / control surface operator token to the user-provided value.
+
+CHANGES:
+- Updated `/etc/systemd/system/control-surface.service` `OPERATOR_TOKEN` environment entry.
+- Reloaded systemd and restarted `control-surface.service`.
+
+EVIDENCE:
+- `control-surface.service` restarted and is active.
+- Local auth smoke passed: `POST /api/auth/session` returned HTTP 200 and the resulting cookie accessed protected `GET /api/codex/sessions` with HTTP 200.
+
+NEXT:
+- Replace manual operator-token prompt with Entra-backed Cloudflare Access identity/session handling when ready.

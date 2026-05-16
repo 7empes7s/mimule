@@ -273,21 +273,27 @@ Decided 2026-05-05:
 
 ---
 
-## Implementation progress (as of 2026-05-05)
+## Implementation progress (as of 2026-05-06)
 
 | Phase | Status | Notes |
 |---|---|---|
 | Phase 0 — Plan freeze | **DONE** | This document |
-| Phase 1 — BFF skeleton | **PARTIAL** | `/api/home` done; no detail-page endpoints yet |
-| Phase 2 — Home page | **NOT STARTED** | No router, no home component |
-| Phase 3 — Charts + sparklines | **NOT STARTED** | recharts not installed |
-| Phase 4 — Detail pages | **NOT STARTED** | No routes |
-| Phase 5+ | **NOT STARTED** | — |
+| Phase 1 — BFF skeleton | **DONE** | All 6 endpoints live: `/api/home`, `/api/autopipeline`, `/api/doctor`, `/api/models`, `/api/newsbites`, `/api/infra` |
+| Phase 2 — Home page | **DONE** | All 32 widgets built in `DashHome.tsx`; wouter routing in place |
+| Phase 3 — Charts + sparklines | **DONE** | recharts BarChart on home 7d sparkbar, NewsBites 30d, Autopipeline stage breakdown, Doctor error classes (horizontal) + verdict mix (donut). SQLite historical store deferred. |
+| Phase 4 — Detail pages | **DONE** | All pages: `AutopipelinePage`, `DoctorPage`, `ModelsPage`, `NewsBitesPage`, `InfraPage`, `OpenCodeRoute` |
+| Phase 5 — Actions | **DONE** | All mutation endpoints live with OPERATOR_TOKEN auth. UI: confirm modal + action buttons on all 4 pages |
+| Phase 7 — SSE | **DONE** | `/api/stream` SSE endpoint live; DashHome uses EventSource (5s push), fallback poll at 60s. SSE dot indicator on home. |
+| `/incidents` page | **DONE** | New `/api/incidents` endpoint + `IncidentsPage.tsx`. Timeline merges pipeline-alerts.json + doctor abandoned entries. Filter by error type / stage. |
+| Phase 6 — OpenCode count | **DEFERRED** | V3.2 |
+| Phase 8 — Polish, SQLite | **DEFERRED** | V3.2 |
 
 **Missing packages** (not yet in `package.json`):
 - `wouter` — routing
 - `recharts` — charts
 - `@tanstack/react-query` — mutation handling (V3.1)
+
+Additive correction note (2026-05-07): this subsection is now historical/stale. `/opt/opencode-control-surface/package.json` contains `wouter` and `recharts`; `@tanstack/react-query` remains absent by design because the implementation uses the local `useAction` hook.
 
 **Missing server API routes** (router.ts only has `/api/home`):
 - `/api/autopipeline` — GET
@@ -297,11 +303,15 @@ Decided 2026-05-05:
 - `/api/infra` — GET (services, timers, Hetzner stats, Vast instance)
 - `/api/incidents` — **V3.1**
 
+Additive correction note (2026-05-07): this subsection is also historical/stale. The current router exposes the listed GET endpoints plus `/api/stream`; the still-missing route relevant to V4 Phase 0 is `POST /api/doctor/scan`.
+
 **Missing adapter capabilities**:
 - `models.ts` — needs to expose full `models[]` array from `model-health.json`, cooldowns detail, fallback chains, and per-model quality from `model-quality.json`
 - `newsbites.ts` — needs all articles (not just published/approved), word count per article, `git log -1` deploy timestamp
 - `system.ts` — needs `systemctl list-timers` parsing to return timer last-run / next-run / status
 - `doctor.ts` — needs a `getFullLog(opts)` export for arbitrary time windows and per-field filtering; needs `nextStage` and `cooldownMs` fields in `DoctorEntry`
+
+Additive correction note (2026-05-07): several adapter capabilities have since been implemented enough for V3, but V4 should verify field-by-field before reusing this list as work scope. The durable gaps are historical SQLite, action descriptors/evidence refs, doctor scan/requeue actions, and deploy metadata reliability.
 
 **Missing data files** (needed before V3.1 actions work):
 - `/var/lib/mimule/model-discovery-log.jsonl` — created by extending `model-health-check.mjs`
