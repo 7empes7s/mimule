@@ -30,6 +30,10 @@ const FIFA_URL =
 const PIPELINE_HTTP = process.env.PIPELINE_HTTP || "http://127.0.0.1:3200";
 const GAFFR_DATA = process.env.GAFFR_DATA || "/opt/provisioned/gaffrpro/apps/web/src/data";
 const LEDGER_PATH = process.env.WC_LEDGER || "/var/lib/mimule/wc-fantasy-ledger.json";
+const ARTICLES_DIR = process.env.NEWSBITES_ARTICLES || "/opt/newsbites/content/articles";
+// Two stories within this many days about the same (kind + subject) are treated
+// as the same event for near-dup suppression.
+const DEDUP_WINDOW_DAYS = parseInt(process.env.WC_DEDUP_WINDOW_DAYS || "10", 10);
 const DOSSIERS_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "dossiers");
 const PER_RUN = parseInt(
   process.argv.find((a) => a.startsWith("--limit="))?.split("=")[1] || process.env.WC_TOPICS_PER_RUN || "6",
@@ -120,6 +124,7 @@ function resultTopics(matches) {
       if (!h || !a) return null;
       return {
         key: `result:${m.IdMatch}`,
+        kind: "result",
         topic: `${h} ${hs}-${as} ${a} at the 2026 FIFA World Cup: match report, standout performers and fantasy takeaways`,
       };
     })
@@ -135,6 +140,7 @@ function performanceTopics(round) {
   const ordered = [...top.filter((x) => x.p.star), ...top.filter((x) => !x.p.star)];
   return ordered.slice(0, 8).map(({ p }) => ({
     key: `perf:${p.id}:md${round}`,
+    kind: "feature",
     topic: `${p.name} of ${p.team} at the 2026 FIFA World Cup: form, standout displays and fantasy outlook`,
   }));
 }
@@ -221,14 +227,65 @@ function wcIndex() {
 function matchWc(title, idx) {
   const toks = new Set(normTokens(title));
   const phrase = ` ${normTokens(title).join(" ")} `;
-  const teams = new Set(), codes = new Set();
+  const teams = new Set(), codes = new Set(), surnames = new Set();
   for (const [surname, v] of idx.surnames) {
-    if (toks.has(surname)) { teams.add(v.team); codes.add(v.code); }
+    if (toks.has(surname)) { teams.add(v.team); codes.add(v.code); surnames.add(surname); }
   }
   for (const [nation, v] of idx.nations) {
     if (nation && phrase.includes(` ${nation} `)) { teams.add(v.team); codes.add(v.code); }
   }
-  return { teams: [...teams], codes: [...codes] };
+  return { teams: [...teams], codes: [...codes], surnames: [...surnames] };
+}
+
+// ── event-signature dedup ───────────────────────────────────────────────────
+// The headline-hashed ledger key (`news:<kind>:<title48>`) only catches the SAME
+// headline twice. Two different stories about the SAME event — e.g. "Brazil
+// confirm Raphinha hamstring injury" and "Raphinha injury uncertainty over
+// Brazilian star" — hash differently and each spawn a near-duplicate article.
+// An event signature collapses them: it keys on (kind + subject), where the
+// subject is the named player(s) when present, else the nation(s). Player
+// precedence matters — when a player is named they ARE the event, and different
+// headlines about them may or may not also name the country.
+function detectKind(title) {
+  if (/\b\d{1,2}\s*[-–]\s*\d{1,2}\b/.test(title) && /world\s*cup/i.test(title)) return "result";
+  if (/\b(injur|ruled out|fitness|doubt|knock|sidelined|out for|hamstring|setback|recover|return from)/i.test(title)) return "injury";
+  if (/\b(transfer|signing|signs|signed|move to|deal|fee|bid|loan|contract|joins?|swoop)/i.test(title)) return "transfer";
+  return "feature";
+}
+
+function eventSig(kind, match) {
+  const subjects = match.surnames.length
+    ? [...match.surnames].sort()
+    : [...match.codes].map((c) => c.toLowerCase()).sort();
+  return `evt:${kind}:${subjects.join("+")}`;
+}
+
+// Scan already-published World Cup articles within a recent window and return the
+// set of event signatures they already cover, so we never queue a near-dup of a
+// story that's already live (caught even if it never passed through our ledger).
+function scanExistingSignatures(idx, windowDays) {
+  const sigs = new Set();
+  const cutoff = Date.now() - windowDays * 86400000;
+  let dir;
+  try { dir = fs.readdirSync(ARTICLES_DIR); } catch { return sigs; }
+  for (const file of dir) {
+    if (!file.endsWith(".md")) continue;
+    let md;
+    try { md = fs.readFileSync(path.join(ARTICLES_DIR, file), "utf8"); } catch { continue; }
+    const fm = (md.match(/^---\n([\s\S]*?)\n---/) || [])[1] || "";
+    const status = (fm.match(/^status:\s*"?(\w+)"?/m) || [])[1] || "";
+    if (!/^(published|approved)$/.test(status)) continue;
+    const title = (fm.match(/^title:\s*"?(.*?)"?\s*$/m) || [])[1] || "";
+    const dateStr = (fm.match(/^date:\s*"?(.*?)"?\s*$/m) || [])[1] || "";
+    const isWc = /world\s*cup|fifa-world-cup/i.test(fm) || /world\s*cup/i.test(title);
+    if (!isWc || !title) continue;
+    const t = new Date(dateStr).getTime();
+    if (!isNaN(t) && t < cutoff) continue; // outside the near-dup window
+    const match = matchWc(title, idx);
+    if (!match.surnames.length && !match.codes.length) continue;
+    sigs.add(eventSig(detectKind(title), match));
+  }
+  return sigs;
 }
 
 // Vague/listicle headlines have no single verifiable claim and reliably die in
@@ -396,17 +453,33 @@ async function main() {
   const matches = await fetchFifa();
   const round = maxFinishedRound(matches);
   const ledger = loadLedger();
+  const idx = wcIndex();
+
+  // Event signatures already covered: by the persistent ledger AND by articles
+  // already live on the site (the latter catches near-dups our ledger never saw,
+  // e.g. pre-ledger or from another source). `sigSeen` also collapses two
+  // candidates for the same event inside a single run.
+  const existingSigs = scanExistingSignatures(idx, DEDUP_WINDOW_DAYS);
+  const sigSeen = new Set();
+  const dupSig = (sig) => sigSeen.has(sig) || ledger.has(sig) || existingSigs.has(sig);
 
   // 1) Data-grounded angles that survive the research gate: match results +
   //    star-player performances. Queued via cmd:add (creates dossier at research).
+  let dupData = 0;
   const dataFresh = interleave([resultTopics(matches), performanceTopics(round)])
     .filter((c) => !ledger.has(c.key))
+    .filter((c) => {
+      c.sig = eventSig(c.kind, matchWc(c.topic, idx));
+      if (dupSig(c.sig)) { dupData++; return false; }
+      sigSeen.add(c.sig);
+      return true;
+    })
     .slice(0, PER_RUN);
 
   // 2) Source-grounded injury/transfer from real reporting, injected at research.
-  const idx = wcIndex();
   const sourced = [];
   const seen = new Set();
+  let dupSourced = 0;
   for (const { kind, q } of NEWS_QUERIES) {
     for (const item of await fetchGoogleNews(q)) {
       if (SKIP_TITLE.test(item.title)) continue; // vague/listicle → dies in research
@@ -415,19 +488,22 @@ async function main() {
       const key = `news:${kind}:${normWord(item.title).slice(0, 48)}`;
       if (ledger.has(key) || seen.has(key)) continue;
       seen.add(key);
-      sourced.push({ key, kind, item, match });
+      const sig = eventSig(kind, match);
+      if (dupSig(sig)) { dupSourced++; continue; } // near-dup of an existing/queued event
+      sigSeen.add(sig);
+      sourced.push({ key, sig, kind, item, match });
     }
   }
   const sourcedPicked = sourced.slice(0, SOURCED_PER_RUN);
 
-  log(`round ${round} · data-grounded ${dataFresh.length} · sourced ${sourcedPicked.length}/${sourced.length} · ${DRY_RUN ? "DRY RUN" : "live"}`);
+  log(`round ${round} · data-grounded ${dataFresh.length} · sourced ${sourcedPicked.length}/${sourced.length} · skipped near-dups: data ${dupData}, sourced ${dupSourced} (${existingSigs.size} live sigs) · ${DRY_RUN ? "DRY RUN" : "live"}`);
 
   let queued = 0;
   for (const c of dataFresh) {
     if (DRY_RUN) { log(`would add [${c.key}] ${c.topic}`); continue; }
     try {
       const msg = await postCommand({ cmd: "add", topic: c.topic, vertical: "sports" });
-      ledger.add(c.key); queued++; log(`added [${c.key}] → ${msg}`);
+      ledger.add(c.key); if (c.sig) ledger.add(c.sig); queued++; log(`added [${c.key}] → ${msg}`);
     } catch (e) { log(`FAILED [${c.key}]: ${e.message}`); }
   }
   for (const s of sourcedPicked) {
@@ -438,7 +514,7 @@ async function main() {
     try {
       const { dossierDir, slug } = buildSourcedDossier(s.item, s.match, s.kind);
       const msg = await postCommand({ cmd: "inject", dossierDir, stage: "research", slug });
-      ledger.add(s.key); queued++; log(`injected [${s.key}] (${s.item.source}) → ${msg}`);
+      ledger.add(s.key); if (s.sig) ledger.add(s.sig); queued++; log(`injected [${s.key}] (${s.item.source}) → ${msg}`);
     } catch (e) { log(`FAILED [${s.key}]: ${e.message}`); }
   }
 
@@ -446,7 +522,13 @@ async function main() {
   log(`done — ${queued} queued.`);
 }
 
-main().catch((e) => {
-  log("FATAL", e.message);
-  process.exit(1);
-});
+// Pure helpers exported for unit tests; the pipeline run only fires when the
+// script is executed directly (not when imported).
+export { detectKind, eventSig, matchWc, wcIndex, scanExistingSignatures };
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  main().catch((e) => {
+    log("FATAL", e.message);
+    process.exit(1);
+  });
+}
