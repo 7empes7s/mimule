@@ -23,16 +23,20 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const FIFA_URL =
   "https://api.fifa.com/api/v3/calendar/matches?idCompetition=17&idSeason=285023&count=104&language=en";
 const PIPELINE_HTTP = process.env.PIPELINE_HTTP || "http://127.0.0.1:3200";
 const GAFFR_DATA = process.env.GAFFR_DATA || "/opt/provisioned/gaffrpro/apps/web/src/data";
 const LEDGER_PATH = process.env.WC_LEDGER || "/var/lib/mimule/wc-fantasy-ledger.json";
+const DOSSIERS_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "dossiers");
 const PER_RUN = parseInt(
   process.argv.find((a) => a.startsWith("--limit="))?.split("=")[1] || process.env.WC_TOPICS_PER_RUN || "6",
   10,
 );
+// Source-grounded injury/transfer items injected per run (from real reporting).
+const SOURCED_PER_RUN = parseInt(process.env.WC_SOURCED_PER_RUN || "4", 10);
 const DRY_RUN = process.argv.includes("--dry-run");
 
 const log = (...a) => console.log(new Date().toISOString(), "[wc-fantasy]", ...a);
@@ -95,23 +99,7 @@ function topPerformers(limit = 8) {
     .slice(0, limit);
 }
 
-// High value-for-money picks (points per £m), excluding the obvious stars, as
-// differential candidates.
-function valuePicks(limit = 6) {
-  const stats = readJson("stats.json");
-  const playersRaw = readJson("players.json");
-  if (!stats?.players || !playersRaw) return [];
-  const players = playersRaw.players || playersRaw;
-  const byId = new Map(players.map((p) => [String(p.id), p]));
-  return Object.entries(stats.players)
-    .map(([id, s]) => ({ p: byId.get(String(id)), s }))
-    .filter((x) => x.p && (x.s.points ?? 0) >= 4 && x.p.price)
-    .map((x) => ({ ...x, value: (x.s.points ?? 0) / x.p.price }))
-    .sort((a, b) => b.value - a.value)
-    .slice(0, limit);
-}
-
-// ── topic builders (each yields { key, topic }) ─────────────────────────────
+// ── data-grounded topic builders (each yields { key, topic }) ───────────────
 function isFinished(m) {
   return m.MatchStatus === 0 && (m.HomeTeamScore != null || m.AwayTeamScore != null);
 }
@@ -138,21 +126,6 @@ function resultTopics(matches) {
     .filter(Boolean);
 }
 
-function previewTopics(matches) {
-  return matches
-    .filter(isUpcoming)
-    .sort((a, b) => new Date(a.Date) - new Date(b.Date))
-    .map((m) => {
-      const h = teamName(m.Home), a = teamName(m.Away);
-      if (!h || !a) return null;
-      return {
-        key: `preview:${m.IdMatch}`,
-        topic: `${h} vs ${a} 2026 FIFA World Cup preview: team news, form, predicted lineups and fantasy picks`,
-      };
-    })
-    .filter(Boolean);
-}
-
 function performanceTopics(round) {
   // Prefer marquee names (star flag) — they're the most newsworthy and the most
   // likely to have verifiable coverage, so they survive the research integrity
@@ -166,55 +139,242 @@ function performanceTopics(round) {
   }));
 }
 
-function transferTopics(round) {
-  return topPerformers(3).map(({ p }) => ({
-    key: `transfer:${p.id}:md${round}`,
-    topic: `${p.name}'s 2026 FIFA World Cup form for ${p.team} fuels transfer speculation: what clubs and fantasy managers should know`,
-  }));
+// ── real-source ingestion (Google News RSS) ─────────────────────────────────
+// Injury & transfer angles die in the research integrity gate when asked to be
+// written from the model's memory of a "future" tournament. So we ground them in
+// REAL current reporting via Google News RSS search — which surfaces ESPN, BBC,
+// The Athletic, Transfermarkt and Fabrizio Romano-sourced stories. For each item
+// that names a World Cup player/nation we pre-seed a dossier with the source and
+// inject at the research stage, so the desk writes from a real, citable basis.
+
+const NEWS_QUERIES = [
+  { kind: "injury", q: '"world cup" (injury OR "ruled out" OR fitness OR doubt OR knock) when:5d' },
+  { kind: "transfer", q: '"world cup" (transfer OR "Fabrizio Romano" OR Transfermarkt OR signing) when:5d' },
+];
+
+function normWord(s) {
+  return (s || "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/[^a-z]/g, "");
 }
 
-function scoutingTopics(round) {
-  const picks = valuePicks(5);
-  const names = picks.slice(0, 3).map((x) => `${x.p.name} (${x.p.team})`).join(", ");
-  const out = [
-    {
-      key: `scout:value:md${round}`,
-      topic: `2026 FIFA World Cup fantasy scouting: best-value picks and differentials${names ? ` such as ${names}` : ""}`,
-    },
-  ];
-  for (const pos of ["defender", "midfielder", "forward"]) {
-    out.push({
-      key: `scout:${pos}:md${round}`,
-      topic: `2026 FIFA World Cup fantasy scouting: standout ${pos} options, form and budget differentials`,
-    });
-  }
-  return out;
+function decodeEntities(s) {
+  return (s || "")
+    .replace(/<!\[CDATA\[(.*?)\]\]>/gs, "$1")
+    .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"').replace(/&#0?39;/g, "'").replace(/&apos;/g, "'");
 }
 
-function injuryTopics(matches, round) {
-  // Prominent teams = those in the most upcoming fixtures soon, plus top scorers' nations.
-  const soon = matches
-    .filter(isUpcoming)
-    .sort((a, b) => new Date(a.Date) - new Date(b.Date))
-    .slice(0, 8);
-  const teams = new Set();
-  for (const m of soon) {
-    teams.add(teamName(m.Home));
-    teams.add(teamName(m.Away));
+async function fetchGoogleNews(query) {
+  const url = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=en-US&gl=US&ceid=US:en`;
+  try {
+    const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" }, signal: AbortSignal.timeout(20000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const xml = await res.text();
+    return [...xml.matchAll(/<item>(.*?)<\/item>/gs)]
+      .map((m) => {
+        const it = m[1];
+        const pick = (re) => (it.match(re)?.[1] || "").trim();
+        let title = decodeEntities(pick(/<title>(.*?)<\/title>/s));
+        const source = decodeEntities(pick(/<source[^>]*>(.*?)<\/source>/s));
+        if (source && title.endsWith(` - ${source}`)) title = title.slice(0, -(source.length + 3));
+        const desc = decodeEntities(pick(/<description>(.*?)<\/description>/s)).replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+        return { title, source: source || "Google News", desc, link: decodeEntities(pick(/<link>(.*?)<\/link>/s)), date: pick(/<pubDate>(.*?)<\/pubDate>/s) };
+      })
+      .filter((x) => x.title);
+  } catch (e) {
+    log(`WARN Google News (${query.slice(0, 28)}…): ${e.message}`);
+    return [];
   }
-  for (const { p } of topPerformers(4)) teams.add(p.team);
-  return [...teams].filter(Boolean).map((t) => ({
-    key: `injury:${t}:md${round}`,
-    topic: `2026 FIFA World Cup injury and availability update: latest team news and fantasy impact for ${t}`,
-  }));
+}
+
+// Tokenise to diacritic-folded lowercase words (spaces preserved) for
+// word-boundary matching — avoids substring false positives.
+function normTokens(s) {
+  return (s || "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/[^a-z]+/g, " ").trim().split(/\s+/).filter(Boolean);
+}
+
+// Index of WC nations (as token phrases) + player surnames from GaffrPro data,
+// so we only act on items that map to our player universe (and thus match in
+// GaffrPro's feed).
+function wcIndex() {
+  const playersRaw = readJson("players.json");
+  const players = playersRaw?.players || playersRaw || [];
+  const nations = new Map(); // "new zealand" -> { team, code }
+  const surnames = new Map(); // "raphinha" -> { team, code, name }
+  // Generic name particles that collide across many players — never index alone.
+  const GENERIC = new Set(["junior", "silva", "santos", "souza", "pereira", "oliveira", "diallo", "traore"]);
+  for (const p of players) {
+    nations.set(normTokens(p.team).join(" "), { team: p.team, code: p.code });
+    // Index the surname (last name token) only — indexing first names causes
+    // collisions (e.g. "Jesse", "Christian" matching unrelated players).
+    const toks = normTokens(p.name);
+    const last = toks[toks.length - 1];
+    if (last && last.length >= 5 && !GENERIC.has(last)) surnames.set(last, { team: p.team, code: p.code, name: p.name });
+  }
+  return { nations, surnames };
+}
+
+// Match a headline to WC teams via whole-word surname + nation-phrase matching.
+// We deliberately don't force a player "focus" — the quoted headline already
+// names the subject, so the writer centres correctly without us guessing (which
+// caused wrong-focus kills when a first name collided with another player's
+// surname).
+function matchWc(title, idx) {
+  const toks = new Set(normTokens(title));
+  const phrase = ` ${normTokens(title).join(" ")} `;
+  const teams = new Set(), codes = new Set();
+  for (const [surname, v] of idx.surnames) {
+    if (toks.has(surname)) { teams.add(v.team); codes.add(v.code); }
+  }
+  for (const [nation, v] of idx.nations) {
+    if (nation && phrase.includes(` ${nation} `)) { teams.add(v.team); codes.add(v.code); }
+  }
+  return { teams: [...teams], codes: [...codes] };
+}
+
+// Vague/listicle headlines have no single verifiable claim and reliably die in
+// the research gate (or mis-focus). Skip them.
+const SKIP_TITLE = /\b(tracker|latest updates?|round-?up|live blog|live updates?|everything you need|player ratings|ratings|quiz|who am i|how do|how to watch|watch:|in pictures|gallery|predictions?|odds|tv schedule|highlights|injury[- ]time|best (goals|moments)|talking points)\b/i;
+
+function slugify(s) {
+  return s.toLowerCase().replace(/[^a-z0-9\s-]/g, "").trim().replace(/\s+/g, "-").slice(0, 80).replace(/-+$/, "");
+}
+
+// Build a dossier seeded with the real source, mirroring the autopipeline's
+// manual-dossier skeleton, and return its dir + slug for injection at research.
+function buildSourcedDossier(item, match, kind) {
+  const dateStr = new Date().toISOString().slice(0, 10);
+  const slug = slugify(`${kind} ${item.title}`) || `wc-${kind}-${Date.now()}`;
+  const dossierDir = path.join(DOSSIERS_ROOT, dateStr, slug);
+  fs.mkdirSync(dossierDir, { recursive: true });
+
+  const teamsLine = match.teams.join(", ");
+  const codesLine = match.codes.join(",");
+  const focus = teamsLine ? ` for ${teamsLine}` : "";
+  const brief =
+    `Based strictly on this report (${item.source}, ${item.date || dateStr}): "${item.title}". ` +
+    `Write a 2026 FIFA World Cup fantasy ${kind} analysis${focus}, centred on the player/subject named in that headline: confirm the situation from the cited source, ` +
+    `explain what it means and the fantasy impact for managers. Do not invent any detail beyond the cited reporting; ` +
+    `if the report is thin, keep the piece tight rather than padding with speculation.`;
+
+  const sourceDate = (() => { const d = new Date(item.date); return isNaN(d) ? new Date().toISOString() : d.toISOString(); })();
+  const sourceSummary = item.desc && item.desc.length > item.title.length ? item.desc : item.title;
+  const sources = [{ url: item.link, type: "news", publisher: item.source, date: sourceDate, why_it_matters: sourceSummary }];
+
+  const dossierMd = `# Story Dossier
+
+## Story Identity
+- Slug: ${slug}
+- Working headline: ${item.title}
+- Vertical: sports
+- Story owner: small-model desk
+- Created: ${new Date().toISOString()}
+- Last updated: ${new Date().toISOString()}
+- Status:
+  - researching
+
+## Editorial Brief (Manual Lead)
+${brief}
+
+## Why This Story Matters
+- Public importance: World Cup ${kind} news with direct fantasy relevance
+- News value: ${item.source} reporting
+- Why now: ${dateStr}
+- Why NewsBites should cover it: Fantasy desk assignment grounded in the cited report
+
+## Core Angle
+- One-sentence framing: TODO — complete from the cited source
+- What the story is not: speculation beyond the cited reporting
+
+## Claim Table
+| Claim | Source(s) | Evidence quality | Confidence | Notes |
+|---|---|---|---|---|
+| ${item.title} | ${item.source} | secondary | medium | verify against the cited URL |
+
+## Primary Sources
+- URL: ${item.link}
+  - Type: news
+  - Publisher: ${item.source}
+  - Date: ${sourceDate}
+  - Notes: Seeded by the WC fantasy desk. Verify and expand from this report.
+
+## Panel Signals
+- competition: fifa-world-cup
+- teams: ${teamsLine}
+- country_codes: ${codesLine}
+
+## Drafting Notes
+- (to be filled during research and write stages)
+
+## Research Notes
+- Seed report: "${item.title}" — ${item.source} (${item.date || dateStr}). Confirm and build on this.
+${item.desc && item.desc !== item.title ? `- Summary: ${item.desc}` : ""}
+`;
+
+  const taskMd = `# Story Task
+
+Story:
+- title: ${item.title}
+- slug: ${slug}
+- vertical: sports
+- story date: ${dateStr}
+- dossier path: ${dossierDir}
+
+Editorial brief:
+${brief}
+
+Files to complete:
+- \`DOSSIER.md\`
+- \`sources.json\`
+- \`draft.md\`
+- \`publish.md\`
+
+Article shape to preserve:
+1. opening paragraph
+2. \`## What happened\`
+3. one explanatory middle section
+4. \`## Why it matters\`
+
+Digest rule:
+- one sentence, 16-28 words, user-facing nutshell, not article prose
+`;
+
+  const stub = (extra) => `---
+title: "TODO"
+slug: ${slug}
+date: "${dateStr}"
+vertical: sports
+tags:
+  - "sports"
+status: draft
+lead: "TODO - one factual sentence after research is complete."
+digest: "TODO - one sentence, 16-28 words, user-facing nutshell."
+coverImage: ""
+author: "NewsBites Desk"
+---
+
+## What happened
+
+TODO
+${extra}
+## Why it matters
+
+TODO
+`;
+
+  fs.writeFileSync(path.join(dossierDir, "DOSSIER.md"), dossierMd);
+  fs.writeFileSync(path.join(dossierDir, "TASK.md"), taskMd);
+  fs.writeFileSync(path.join(dossierDir, "sources.json"), JSON.stringify(sources, null, 2));
+  fs.writeFileSync(path.join(dossierDir, "publish.md"), stub("\n"));
+  fs.writeFileSync(path.join(dossierDir, "draft.md"), stub("\n## Background\n\nTODO\n\n"));
+  return { dossierDir, slug };
 }
 
 // ── queue ───────────────────────────────────────────────────────────────────
-async function enqueue(topic) {
+async function postCommand(body) {
   const res = await fetch(`${PIPELINE_HTTP}/command`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ cmd: "add", topic, vertical: "sports" }),
+    body: JSON.stringify(body),
     signal: AbortSignal.timeout(15000),
   });
   const out = await res.json().catch(() => ({}));
@@ -222,58 +382,68 @@ async function enqueue(topic) {
   return out.message;
 }
 
+function interleave(buckets) {
+  const out = [];
+  for (let i = 0; ; i++) {
+    let added = false;
+    for (const b of buckets) if (b[i]) { out.push(b[i]); added = true; }
+    if (!added) break;
+  }
+  return out;
+}
+
 async function main() {
   const matches = await fetchFifa();
   const round = maxFinishedRound(matches);
   const ledger = loadLedger();
 
-  // Interleave angles for variety, results first (most fact-grounded & timely).
-  const buckets = [
-    resultTopics(matches),
-    previewTopics(matches),
-    performanceTopics(round),
-    scoutingTopics(round),
-    injuryTopics(matches, round),
-    transferTopics(round),
-  ];
-  const candidates = [];
-  for (let i = 0; candidates.length < 200; i++) {
-    let added = false;
-    for (const b of buckets) {
-      if (b[i]) {
-        candidates.push(b[i]);
-        added = true;
-      }
+  // 1) Data-grounded angles that survive the research gate: match results +
+  //    star-player performances. Queued via cmd:add (creates dossier at research).
+  const dataFresh = interleave([resultTopics(matches), performanceTopics(round)])
+    .filter((c) => !ledger.has(c.key))
+    .slice(0, PER_RUN);
+
+  // 2) Source-grounded injury/transfer from real reporting, injected at research.
+  const idx = wcIndex();
+  const sourced = [];
+  const seen = new Set();
+  for (const { kind, q } of NEWS_QUERIES) {
+    for (const item of await fetchGoogleNews(q)) {
+      if (SKIP_TITLE.test(item.title)) continue; // vague/listicle → dies in research
+      const match = matchWc(item.title, idx);
+      if (!match.teams.length) continue; // must map to a WC player/nation
+      const key = `news:${kind}:${normWord(item.title).slice(0, 48)}`;
+      if (ledger.has(key) || seen.has(key)) continue;
+      seen.add(key);
+      sourced.push({ key, kind, item, match });
     }
-    if (!added) break;
   }
+  const sourcedPicked = sourced.slice(0, SOURCED_PER_RUN);
 
-  const fresh = candidates.filter((c) => !ledger.has(c.key));
-  log(`round ${round} · ${candidates.length} candidates · ${fresh.length} fresh · cap ${PER_RUN} · ${DRY_RUN ? "DRY RUN" : "live"}`);
-
-  const picked = fresh.slice(0, PER_RUN);
-  if (!picked.length) {
-    log("nothing fresh to queue.");
-    return;
-  }
+  log(`round ${round} · data-grounded ${dataFresh.length} · sourced ${sourcedPicked.length}/${sourced.length} · ${DRY_RUN ? "DRY RUN" : "live"}`);
 
   let queued = 0;
-  for (const c of picked) {
+  for (const c of dataFresh) {
+    if (DRY_RUN) { log(`would add [${c.key}] ${c.topic}`); continue; }
+    try {
+      const msg = await postCommand({ cmd: "add", topic: c.topic, vertical: "sports" });
+      ledger.add(c.key); queued++; log(`added [${c.key}] → ${msg}`);
+    } catch (e) { log(`FAILED [${c.key}]: ${e.message}`); }
+  }
+  for (const s of sourcedPicked) {
     if (DRY_RUN) {
-      log(`would queue [${c.key}] ${c.topic}`);
+      log(`would inject [${s.key}] (${s.item.source}) "${s.item.title}" → ${s.match.teams.join(", ")}`);
       continue;
     }
     try {
-      const msg = await enqueue(c.topic);
-      ledger.add(c.key);
-      queued++;
-      log(`queued [${c.key}] → ${msg}`);
-    } catch (e) {
-      log(`FAILED [${c.key}]: ${e.message}`);
-    }
+      const { dossierDir, slug } = buildSourcedDossier(s.item, s.match, s.kind);
+      const msg = await postCommand({ cmd: "inject", dossierDir, stage: "research", slug });
+      ledger.add(s.key); queued++; log(`injected [${s.key}] (${s.item.source}) → ${msg}`);
+    } catch (e) { log(`FAILED [${s.key}]: ${e.message}`); }
   }
+
   if (!DRY_RUN) saveLedger(ledger);
-  log(`done — ${queued}/${picked.length} queued.`);
+  log(`done — ${queued} queued.`);
 }
 
 main().catch((e) => {
