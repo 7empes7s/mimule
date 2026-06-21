@@ -79,6 +79,49 @@ function setFmLine(md, key, value) {
   return md.replace(/\n---\n/, `\n${line}\n---\n`);
 }
 
+// ── World Cup player photos (preferred over stock) ──────────────────────────
+// Mirror of the autopipeline's resolver: use the real FIFA headshot of the player
+// the article is about, resolved from CAPITALISED tokens in the title/lead.
+const GAFFR_DATA = process.env.GAFFR_DATA || "/opt/provisioned/gaffrpro/apps/web/src/data";
+const WC_NAME_STOP = new Set(["junior", "silva", "santos", "souza", "pereira", "oliveira", "diallo", "traore"]);
+let _wcIndex = null;
+function wcPlayerIndex() {
+  if (_wcIndex !== null) return _wcIndex;
+  try {
+    const players = JSON.parse(fs.readFileSync(path.join(GAFFR_DATA, "players.json"), "utf8"));
+    const roster = players.players || players.squads || players;
+    const photos = JSON.parse(fs.readFileSync(path.join(GAFFR_DATA, "stats.json"), "utf8")).photos || {};
+    const bySurname = new Map();
+    for (const p of roster) {
+      const photo = photos[String(p.id)];
+      if (!photo) continue;
+      const toks = String(p.name).normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/[^a-z]+/g, " ").trim().split(/\s+/);
+      const last = toks[toks.length - 1];
+      if (last && last.length >= 4 && !WC_NAME_STOP.has(last) && !bySurname.has(last)) bySurname.set(last, { name: p.name, team: p.team, photo });
+    }
+    _wcIndex = bySurname;
+  } catch (e) { log(`roster unavailable: ${e.message}`); _wcIndex = new Map(); }
+  return _wcIndex;
+}
+function capTokens(s) {
+  return (String(s).normalize("NFD").replace(/[̀-ͯ]/g, "").match(/\b[A-Z][A-Za-z'’-]*\b/g) || [])
+    .map((w) => w.toLowerCase().replace(/[^a-z]/g, "")).filter((w) => w.length >= 4);
+}
+function resolveWcPlayer(title, lead) {
+  const idx = wcPlayerIndex();
+  for (const text of [title, lead]) for (const w of capTokens(text)) { const p = idx.get(w); if (p) return p; }
+  return null;
+}
+async function downloadPlayerPhoto(url) {
+  const res = await fetch(url, { signal: AbortSignal.timeout(30000) });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const ct = res.headers.get("content-type") || "";
+  const ext = ct.includes("png") ? "png" : ct.includes("webp") ? "webp" : "jpg";
+  const buf = Buffer.from(await res.arrayBuffer());
+  if (buf.length < 2000) throw new Error("image too small");
+  return { buf, ext };
+}
+
 async function main() {
   if (!PEXELS) { log("FATAL: PEXELS_API_KEY not set"); process.exit(1); }
   let used = new Set();
@@ -94,35 +137,57 @@ async function main() {
     if (!/^(published|approved)$/.test(status) || vertical !== "sports") continue;
     const tags = fmTags(fm);
     if (!isWorldCup(fm, tags)) continue;
-    targets.push({ file, slug: fmField(fm, "slug") || file.replace(/\.md$/, ""), title: fmField(fm, "title"), tags });
+    targets.push({ file, slug: fmField(fm, "slug") || file.replace(/\.md$/, ""), title: fmField(fm, "title"), lead: fmField(fm, "lead"), tags });
   }
   log(`${targets.length} published World Cup articles to re-image${LIMIT ? ` (cap ${LIMIT})` : ""}.`);
 
   const picked = LIMIT ? targets.slice(0, LIMIT) : targets;
-  let done = 0;
+  let done = 0, byPlayer = 0;
   for (const t of picked) {
+    const player = resolveWcPlayer(t.title, t.lead);
     const query = buildQuery(t.title, t.tags);
-    if (DRY) { log(`would re-image ${t.slug} ← "${query}"`); continue; }
+    if (DRY) {
+      log(player ? `would set ${t.slug} ← PLAYER ${player.name} (${player.team})` : `would set ${t.slug} ← stock "${query}"`);
+      continue;
+    }
+    const fp = path.join(ARTICLES, t.file);
+    // 1) Prefer the real player's FIFA photo.
+    if (player) {
+      try {
+        const { buf, ext } = await downloadPlayerPhoto(player.photo);
+        const outName = `${t.slug}-pl.${ext}`;
+        fs.writeFileSync(path.join(PUBLIC, outName), buf);
+        const imageSource = JSON.stringify({ type: "player-photo", provider: "fifa", player: player.name, team: player.team, sourceUrl: player.photo });
+        let md = fs.readFileSync(fp, "utf8");
+        md = setFmLine(md, "coverImage", `/images/articles/${outName}`);
+        md = setFmLine(md, "imageSource", yamlEscape(imageSource));
+        fs.writeFileSync(fp, md);
+        done++; byPlayer++;
+        log(`✓ ${t.slug} → PLAYER ${player.name} (${player.team})`);
+        continue;
+      } catch (e) {
+        log(`… ${t.slug}: player photo (${player.name}) failed: ${e.message} — using stock`);
+      }
+    }
+    // 2) Fall back to football stock.
     try {
       const p = await pexelsPick(query, used);
       used.add(p.id);
       const outName = `${t.slug}-fb.jpg`;
       fs.writeFileSync(path.join(PUBLIC, outName), p.buf);
-      const cover = `/images/articles/${outName}`;
       const imageSource = JSON.stringify({ type: "stock", provider: "pexels", photographer: p.photographer, photographerUrl: p.photographerUrl, sourceUrl: p.sourceUrl });
-      const fp = path.join(ARTICLES, t.file);
       let md = fs.readFileSync(fp, "utf8");
-      md = setFmLine(md, "coverImage", cover);
+      md = setFmLine(md, "coverImage", `/images/articles/${outName}`);
       md = setFmLine(md, "imageSource", yamlEscape(imageSource));
       fs.writeFileSync(fp, md);
       done++;
-      log(`✓ ${t.slug} → #${p.id} (${p.photographer})`);
+      log(`✓ ${t.slug} → stock #${p.id} (${p.photographer})`);
       await new Promise((r) => setTimeout(r, 350)); // be gentle on Pexels
     } catch (e) {
       log(`✗ ${t.slug}: ${e.message}`);
     }
   }
-  log(`done — ${done}/${picked.length} re-imaged.${DRY ? " (dry run)" : ""}`);
+  log(`done — ${done}/${picked.length} re-imaged (${byPlayer} player photos, ${done - byPlayer} stock).${DRY ? " (dry run)" : ""}`);
 }
 
 main().catch((e) => { log("FATAL", e.message); process.exit(1); });

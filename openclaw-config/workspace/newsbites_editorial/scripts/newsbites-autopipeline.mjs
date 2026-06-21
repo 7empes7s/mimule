@@ -1591,6 +1591,94 @@ async function verifyImageRelevance(buf, ext, title, lead) {
   }
 }
 
+// ── World Cup cover images: use the real player's FIFA photo ─────────────────
+// Generic football stock/AI art is topically right but visually random. For WC
+// articles we have something far better: the official FIFA headshot of the player
+// the piece is actually about. We resolve that player from the headline (the
+// subject) or the lead (e.g. a match's standout scorer) against GaffrPro's roster
+// and use their photo as the cover — "the player's picture", as asked.
+const GAFFR_DATA = process.env.GAFFR_DATA || "/opt/provisioned/gaffrpro/apps/web/src/data";
+const WC_NAME_STOP = new Set(["junior", "silva", "santos", "souza", "pereira", "oliveira", "diallo", "traore"]);
+let _wcPlayerIndex = null;
+
+function loadWcPlayerIndex() {
+  if (_wcPlayerIndex !== null) return _wcPlayerIndex;
+  try {
+    const players = JSON.parse(fs.readFileSync(path.join(GAFFR_DATA, "players.json"), "utf8"));
+    const roster = players.players || players.squads || players;
+    const photos = JSON.parse(fs.readFileSync(path.join(GAFFR_DATA, "stats.json"), "utf8")).photos || {};
+    const bySurname = new Map(); // surname -> { id, name, team, photo }
+    for (const p of roster) {
+      const photo = photos[String(p.id)];
+      if (!photo) continue; // only players we can actually show
+      const toks = String(p.name).normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/[^a-z]+/g, " ").trim().split(/\s+/);
+      const last = toks[toks.length - 1];
+      // First indexed surname wins, so an ambiguous name maps to one player only.
+      if (last && last.length >= 4 && !WC_NAME_STOP.has(last) && !bySurname.has(last)) {
+        bySurname.set(last, { id: String(p.id), name: p.name, team: p.team, photo });
+      }
+    }
+    _wcPlayerIndex = { bySurname };
+  } catch (e) {
+    log(`[wc-photo] roster unavailable: ${e.message}`);
+    _wcPlayerIndex = { bySurname: new Map() };
+  }
+  return _wcPlayerIndex;
+}
+
+function isWorldCupArticle(title, tags) {
+  return tags.some((t) => /world-?cup|fifa-world-cup|wc-?2026/i.test(t)) || /world\s*cup/i.test(title);
+}
+
+// Find the WC player the article is about. Prefer a surname in the headline (the
+// subject); fall back to the lead (match recaps name the scorer there). We only
+// consider CAPITALISED tokens (proper nouns) — surnames in a headline are always
+// capitalised, common words aren't — which kills collisions like the word
+// "basic" matching the surname "Bašić".
+function capitalisedTokens(s) {
+  const folded = String(s).normalize("NFD").replace(/[̀-ͯ]/g, "");
+  return (folded.match(/\b[A-Z][A-Za-z'’-]*\b/g) || [])
+    .map((w) => w.toLowerCase().replace(/[^a-z]/g, ""))
+    .filter((w) => w.length >= 4);
+}
+function resolveWcPlayerPhoto(title, lead, tags) {
+  if (!isWorldCupArticle(title, tags)) return null;
+  const { bySurname } = loadWcPlayerIndex();
+  if (!bySurname.size) return null;
+  for (const text of [title, lead]) {
+    for (const w of capitalisedTokens(text)) {
+      const p = bySurname.get(w);
+      if (p) return p;
+    }
+  }
+  return null;
+}
+
+async function tryWcPlayerCover(slug, title, lead, tags, publishContent, publishPath) {
+  const player = resolveWcPlayerPhoto(title, lead, tags);
+  if (!player) return false;
+  try {
+    const res = await fetch(player.photo, { signal: AbortSignal.timeout(30_000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const ct = res.headers.get("content-type") || "";
+    const ext = ct.includes("png") ? "png" : ct.includes("webp") ? "webp" : "jpg";
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length < 2000) throw new Error("image too small");
+    fs.mkdirSync(ARTICLES_IMG_DIR, { recursive: true });
+    fs.writeFileSync(path.join(ARTICLES_IMG_DIR, `${slug}.${ext}`), buf);
+    const coverImageValue = `/images/articles/${slug}.${ext}`;
+    const sourceJson = JSON.stringify({ type: "player-photo", provider: "fifa", player: player.name, team: player.team, sourceUrl: player.photo });
+    let patched = publishContent.replace(/^coverImage:.*$/m, `coverImage: "${coverImageValue}"`);
+    patched = patchFrontmatterField(patched, "imageSource", sourceJson);
+    fs.writeFileSync(publishPath, patched, "utf8");
+    log(`[${slug}] ✅ WC cover = FIFA photo of ${player.name} (${player.team}) → ${coverImageValue}`);
+    return true;
+  } catch (e) {
+    log(`[${slug}] WC player photo (${player.name}) failed: ${e.message} — falling back to AI/stock`);
+    return false;
+  }
+}
+
 async function execFetchImage(dossierDir) {
   const slug = path.basename(dossierDir);
   const publishPath = path.join(dossierDir, "publish.md");
@@ -1606,6 +1694,9 @@ async function execFetchImage(dossierDir) {
   const vertical = (fm.match(/^vertical:\s*["']?(\S+?)["']?\s*$/m) || [])[1]?.trim() || "ai";
   const lead     = (fm.match(/^lead:\s*["']?(.+?)["']?\s*$/m) || [])[1]?.trim() || "";
   const tags     = [...fm.matchAll(/^  - (.+)$/gm)].map(m => m[1].trim());
+
+  // World Cup articles: prefer the real player's FIFA photo over generic art.
+  if (vertical === "sports" && await tryWcPlayerCover(slug, title, lead, tags, publishContent, publishPath)) return;
 
   const richPrompt    = buildImagePrompt(title, vertical, lead, tags);
   const genericPrompt = buildImagePrompt(title, vertical, "", []);
