@@ -1598,30 +1598,41 @@ async function verifyImageRelevance(buf, ext, title, lead) {
 // subject) or the lead (e.g. a match's standout scorer) against GaffrPro's roster
 // and use their photo as the cover — "the player's picture", as asked.
 const GAFFR_DATA = process.env.GAFFR_DATA || "/opt/provisioned/gaffrpro/apps/web/src/data";
-const WC_NAME_STOP = new Set(["junior", "silva", "santos", "souza", "pereira", "oliveira", "diallo", "traore"]);
+// Suffix particles that aren't a real surname — for these the first name is the
+// identifier (Vinicius "Junior" is known as Vinicius).
+const NAME_PARTICLES = new Set(["junior", "filho", "neto", "segundo"]);
 let _wcPlayerIndex = null;
 
+function wcOrderedTokens(name) {
+  return String(name).normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/[^a-z]+/g, " ").trim().split(/\s+/).filter((t) => t.length >= 4);
+}
+
+// Index players by their KEY token — the surname, or the first name when the
+// surname is a suffix particle. Keying on the surname (not first names) means a
+// bare first name in the text — e.g. a manager "Steve" Clarke — never matches a
+// player; collision-prone surnames (Diallo, Silva…) are then disambiguated by
+// full name at resolve time, so "Amad Diallo" still wins.
 function loadWcPlayerIndex() {
   if (_wcPlayerIndex !== null) return _wcPlayerIndex;
   try {
     const players = JSON.parse(fs.readFileSync(path.join(GAFFR_DATA, "players.json"), "utf8"));
     const roster = players.players || players.squads || players;
     const photos = JSON.parse(fs.readFileSync(path.join(GAFFR_DATA, "stats.json"), "utf8")).photos || {};
-    const bySurname = new Map(); // surname -> { id, name, team, photo }
+    const byKey = new Map(); // key token -> candidate[]
     for (const p of roster) {
       const photo = photos[String(p.id)];
       if (!photo) continue; // only players we can actually show
-      const toks = String(p.name).normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/[^a-z]+/g, " ").trim().split(/\s+/);
-      const last = toks[toks.length - 1];
-      // First indexed surname wins, so an ambiguous name maps to one player only.
-      if (last && last.length >= 4 && !WC_NAME_STOP.has(last) && !bySurname.has(last)) {
-        bySurname.set(last, { id: String(p.id), name: p.name, team: p.team, photo });
-      }
+      const tokens = wcOrderedTokens(p.name);
+      if (!tokens.length) continue;
+      const last = tokens[tokens.length - 1];
+      const key = NAME_PARTICLES.has(last) && tokens.length > 1 ? tokens[0] : last;
+      const cand = { id: String(p.id), name: p.name, team: p.team, photo, tokens: new Set(tokens) };
+      (byKey.get(key) || byKey.set(key, []).get(key)).push(cand);
     }
-    _wcPlayerIndex = { bySurname };
+    _wcPlayerIndex = { byKey };
   } catch (e) {
     log(`[wc-photo] roster unavailable: ${e.message}`);
-    _wcPlayerIndex = { bySurname: new Map() };
+    _wcPlayerIndex = { byKey: new Map() };
   }
   return _wcPlayerIndex;
 }
@@ -1630,25 +1641,41 @@ function isWorldCupArticle(title, tags) {
   return tags.some((t) => /world-?cup|fifa-world-cup|wc-?2026/i.test(t)) || /world\s*cup/i.test(title);
 }
 
-// Find the WC player the article is about. Prefer a surname in the headline (the
-// subject); fall back to the lead (match recaps name the scorer there). We only
-// consider CAPITALISED tokens (proper nouns) — surnames in a headline are always
-// capitalised, common words aren't — which kills collisions like the word
-// "basic" matching the surname "Bašić".
+// CAPITALISED tokens only (proper nouns) — surnames in a headline are always
+// capitalised, common words aren't — which kills collisions like the word "basic"
+// matching the surname "Bašić".
 function capitalisedTokens(s) {
   const folded = String(s).normalize("NFD").replace(/[̀-ͯ]/g, "");
   return (folded.match(/\b[A-Z][A-Za-z'’-]*\b/g) || [])
     .map((w) => w.toLowerCase().replace(/[^a-z]/g, ""))
     .filter((w) => w.length >= 4);
 }
+
+// Find the WC player the article is about. Walk the capitalised tokens of the
+// headline (the subject), then the lead (a match's standout scorer), in order;
+// the first token that is a player's KEY (surname) and resolves to a UNIQUE
+// player wins. A shared surname is disambiguated by how many of each candidate's
+// name tokens appear in the text — "Amad Diallo" beats every other "… Diallo" —
+// and a bare ambiguous surname (a lone "Silva") resolves to nobody → stock.
 function resolveWcPlayerPhoto(title, lead, tags) {
   if (!isWorldCupArticle(title, tags)) return null;
-  const { bySurname } = loadWcPlayerIndex();
-  if (!bySurname.size) return null;
+  const { byKey } = loadWcPlayerIndex();
+  if (!byKey.size) return null;
   for (const text of [title, lead]) {
-    for (const w of capitalisedTokens(text)) {
-      const p = bySurname.get(w);
-      if (p) return p;
+    const caps = capitalisedTokens(text);
+    const capsSet = new Set(caps);
+    for (const tok of caps) {
+      const cands = byKey.get(tok);
+      if (!cands || !cands.length) continue;
+      let best = null, bestScore = -1, tie = false;
+      for (const c of cands) {
+        let score = 0;
+        for (const t of c.tokens) if (capsSet.has(t)) score++;
+        if (score > bestScore) { best = c; bestScore = score; tie = false; }
+        else if (score === bestScore && best && c.id !== best.id) tie = true;
+      }
+      if (best && !tie) return best; // confident, unique
+      // ambiguous on this surname (e.g. a lone shared "Silva") — try the next token
     }
   }
   return null;

@@ -83,7 +83,7 @@ function setFmLine(md, key, value) {
 // Mirror of the autopipeline's resolver: use the real FIFA headshot of the player
 // the article is about, resolved from CAPITALISED tokens in the title/lead.
 const GAFFR_DATA = process.env.GAFFR_DATA || "/opt/provisioned/gaffrpro/apps/web/src/data";
-const WC_NAME_STOP = new Set(["junior", "silva", "santos", "souza", "pereira", "oliveira", "diallo", "traore"]);
+const NAME_PARTICLES = new Set(["junior", "filho", "neto", "segundo"]);
 let _wcIndex = null;
 function wcPlayerIndex() {
   if (_wcIndex !== null) return _wcIndex;
@@ -91,15 +91,18 @@ function wcPlayerIndex() {
     const players = JSON.parse(fs.readFileSync(path.join(GAFFR_DATA, "players.json"), "utf8"));
     const roster = players.players || players.squads || players;
     const photos = JSON.parse(fs.readFileSync(path.join(GAFFR_DATA, "stats.json"), "utf8")).photos || {};
-    const bySurname = new Map();
+    const byKey = new Map(); // surname (or first name if surname is a particle) -> candidate[]
     for (const p of roster) {
       const photo = photos[String(p.id)];
       if (!photo) continue;
-      const toks = String(p.name).normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/[^a-z]+/g, " ").trim().split(/\s+/);
+      const toks = String(p.name).normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/[^a-z]+/g, " ").trim().split(/\s+/).filter((t) => t.length >= 4);
+      if (!toks.length) continue;
       const last = toks[toks.length - 1];
-      if (last && last.length >= 4 && !WC_NAME_STOP.has(last) && !bySurname.has(last)) bySurname.set(last, { name: p.name, team: p.team, photo });
+      const key = NAME_PARTICLES.has(last) && toks.length > 1 ? toks[0] : last;
+      const cand = { name: p.name, team: p.team, photo, tokens: new Set(toks) };
+      (byKey.get(key) || byKey.set(key, []).get(key)).push(cand);
     }
-    _wcIndex = bySurname;
+    _wcIndex = byKey;
   } catch (e) { log(`roster unavailable: ${e.message}`); _wcIndex = new Map(); }
   return _wcIndex;
 }
@@ -107,9 +110,26 @@ function capTokens(s) {
   return (String(s).normalize("NFD").replace(/[̀-ͯ]/g, "").match(/\b[A-Z][A-Za-z'’-]*\b/g) || [])
     .map((w) => w.toLowerCase().replace(/[^a-z]/g, "")).filter((w) => w.length >= 4);
 }
+// Key on the surname; disambiguate shared surnames by full-name overlap (Amad
+// Diallo beats other Diallos); a lone ambiguous surname resolves to nobody.
 function resolveWcPlayer(title, lead) {
-  const idx = wcPlayerIndex();
-  for (const text of [title, lead]) for (const w of capTokens(text)) { const p = idx.get(w); if (p) return p; }
+  const byKey = wcPlayerIndex();
+  for (const text of [title, lead]) {
+    const caps = capTokens(text);
+    const capsSet = new Set(caps);
+    for (const tok of caps) {
+      const cands = byKey.get(tok);
+      if (!cands || !cands.length) continue;
+      let best = null, bestScore = -1, tie = false;
+      for (const c of cands) {
+        let score = 0;
+        for (const t of c.tokens) if (capsSet.has(t)) score++;
+        if (score > bestScore) { best = c; bestScore = score; tie = false; }
+        else if (score === bestScore && best && c.name !== best.name) tie = true;
+      }
+      if (best && !tie) return best;
+    }
+  }
   return null;
 }
 async function downloadPlayerPhoto(url) {
@@ -137,17 +157,27 @@ async function main() {
     if (!/^(published|approved)$/.test(status) || vertical !== "sports") continue;
     const tags = fmTags(fm);
     if (!isWorldCup(fm, tags)) continue;
-    targets.push({ file, slug: fmField(fm, "slug") || file.replace(/\.md$/, ""), title: fmField(fm, "title"), lead: fmField(fm, "lead"), tags });
+    targets.push({ file, slug: fmField(fm, "slug") || file.replace(/\.md$/, ""), title: fmField(fm, "title"), lead: fmField(fm, "lead"), tags, curCover: fmField(fm, "coverImage") });
   }
   log(`${targets.length} published World Cup articles to re-image${LIMIT ? ` (cap ${LIMIT})` : ""}.`);
 
   const picked = LIMIT ? targets.slice(0, LIMIT) : targets;
-  let done = 0, byPlayer = 0;
+  let done = 0, byPlayer = 0, skipped = 0;
   for (const t of picked) {
     const player = resolveWcPlayer(t.title, t.lead);
+    const hasPlayerCover = /-pl\.(png|jpg|jpeg|webp)$/.test(t.curCover || "");
+    const hasCover = !!t.curCover;
+    // Idempotent: a correctly-resolved player already has their photo → leave it;
+    // an article with no player match keeps its existing (football) cover. Only
+    // upgrade an article that now resolves to a player but doesn't have one yet.
+    if ((player && hasPlayerCover) || (!player && hasCover)) {
+      skipped++;
+      if (DRY) log(`skip ${t.slug} (${player ? `already ${player.name}` : "no player, keep current"})`);
+      continue;
+    }
     const query = buildQuery(t.title, t.tags);
     if (DRY) {
-      log(player ? `would set ${t.slug} ← PLAYER ${player.name} (${player.team})` : `would set ${t.slug} ← stock "${query}"`);
+      log(player ? `would UPGRADE ${t.slug} ← PLAYER ${player.name} (${player.team})` : `would set ${t.slug} ← stock "${query}"`);
       continue;
     }
     const fp = path.join(ARTICLES, t.file);
@@ -187,7 +217,7 @@ async function main() {
       log(`✗ ${t.slug}: ${e.message}`);
     }
   }
-  log(`done — ${done}/${picked.length} re-imaged (${byPlayer} player photos, ${done - byPlayer} stock).${DRY ? " (dry run)" : ""}`);
+  log(`done — ${done}/${picked.length} re-imaged (${byPlayer} player photos, ${done - byPlayer} stock), ${skipped} left unchanged.${DRY ? " (dry run)" : ""}`);
 }
 
 main().catch((e) => { log("FATAL", e.message); process.exit(1); });
