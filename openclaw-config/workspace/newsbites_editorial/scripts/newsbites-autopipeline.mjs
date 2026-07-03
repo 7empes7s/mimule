@@ -1887,7 +1887,10 @@ async function execPublish(dossierDir, autoApproved) {
 }
 
 async function execDeploy() {
-  await runProcess("bash", [DEPLOY_SCRIPT], { cwd: "/opt/newsbites", timeoutMs: 5 * 60_000 });
+  // The site build outgrew the old 5-min cap (2026-07-02: ~6 min at 600+ articles),
+  // which killed every deploy at timeout and left the live site stale for days.
+  const timeoutMs = Number(process.env.DEPLOY_TIMEOUT_MS) || 15 * 60_000;
+  await runProcess("bash", [DEPLOY_SCRIPT], { cwd: "/opt/newsbites", timeoutMs });
 }
 
 async function execNotify(item) {

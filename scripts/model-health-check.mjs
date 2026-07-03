@@ -95,8 +95,8 @@ const WORKLOAD_PROBE_MAX_TOK  = 150;
 const WORKLOAD_TTL_MS         = 24 * 3600 * 1000;
 const WORKLOAD_QUEUE_DEPTH       = 8;                       // cloud models workload-scored per run (oldest-first rotation)
 const WORKLOAD_CLI_MAX_PER_RUN   = 3;                       // cap opencode-CLI workload probes per run (they are slow)
-const AVAILABILITY_RETEST_MS     = 3 * 24 * 3600 * 1000;    // re-ping a "healthy" cloud model if last checked > 3 days ago
-const AVAILABILITY_RETEST_MAX    = 10;                      // cap stale healthy-cloud re-pings per run (avoid rate limits)
+const AVAILABILITY_RETEST_MS     = 24 * 3600 * 1000;        // re-ping a "healthy" cloud model if last REALLY probed > 24h ago
+const AVAILABILITY_RETEST_MAX    = 24;                      // cap stale healthy-cloud re-pings per run (avoid rate limits)
 const RETIRE_AFTER_MS            = 30 * 24 * 3600 * 1000;   // drop models unavailable continuously > 30 days
 const BENCHMARKS_FILE         = "/var/lib/mimule/model-benchmarks.json";
 
@@ -187,6 +187,9 @@ async function runWorkloadProbe(model, taskKey) {
         temperature: 0,
         max_tokens: WORKLOAD_PROBE_MAX_TOK,
         store: false,
+        // Disable router fallbacks so we score THIS model, not whichever
+        // fallback silently answered for a dead group.
+        fallbacks: [],
       }),
     });
     clearTimeout(timer);
@@ -771,6 +774,10 @@ async function testLitellm(modelName) {
         temperature: 0,
         max_tokens: PING_MAX_TOKENS,
         store: false,
+        // Disable router fallbacks: a dead group must report its own true
+        // status (404/429), not a fallback's 200 (2026-07-02 cerebras bug —
+        // dead models stayed "available: true" and kept being re-selected).
+        fallbacks: [],
       }),
     });
     clearTimeout(timer);
@@ -843,7 +850,8 @@ async function testDirect(model, retryOnRateLimit = true) {
         messages: [{ role: "user", content: PING_PROMPT }],
         temperature: 0,
         max_tokens: PING_MAX_TOKENS,
-        store: false,
+        // no "store": OpenAI-only param — cerebras and other strict providers
+        // reject unknown properties with HTTP 400 (false "unavailable").
       }),
     });
     clearTimeout(timer);
@@ -1485,8 +1493,11 @@ function shouldTestModel(model, prev, quality) {
 
   // Re-test healthy cloud models that have gone stale, so silently-dead providers
   // get caught and recovered models get re-promoted (capped per run by the caller).
-  const lastTested = prev.lastTestedAt ?? prev.checkedAt ?? 0;
-  if (Date.now() - lastTested > AVAILABILITY_RETEST_MS) return "stale";
+  // Only lastTestedAt counts as a real probe — checkedAt is re-stamped on every
+  // copy-forward, so using it here would reset the staleness clock forever
+  // (2026-07-03: dead cerebras models stayed "available: true" for weeks).
+  if (!prev.lastTestedAt) return "stale";
+  if (Date.now() - prev.lastTestedAt > AVAILABILITY_RETEST_MS) return "stale";
   return false;
 }
 
@@ -1505,12 +1516,13 @@ async function testCandidateSet(candidates, now, prevMap, quality) {
     } else {
       // Copy-forward path: prev result preserved, registry fields refreshed,
       // pricingTier recomputed every cycle so taxonomy changes propagate
-      // without waiting for a re-probe.
-      toCopy.push({ ...prev, ...model, checkedAt: now, pricingTier: pricingTierFor(model) });
+      // without waiting for a re-probe. lastTestedAt must survive untouched —
+      // it is the staleness clock and only a real probe may advance it.
+      toCopy.push({ ...prev, ...model, lastTestedAt: prev.lastTestedAt ?? null, checkedAt: now, pricingTier: pricingTierFor(model) });
     }
   }
-  // Oldest-checked stale models first; cap how many we re-ping per run.
-  const lastTestedOf = (name) => prevMap.get(name)?.lastTestedAt ?? prevMap.get(name)?.checkedAt ?? 0;
+  // Never-really-probed first, then oldest real probe; cap re-pings per run.
+  const lastTestedOf = (name) => prevMap.get(name)?.lastTestedAt ?? 0;
   staleCandidates.sort((a, b) => lastTestedOf(a.logicalName) - lastTestedOf(b.logicalName));
   for (let i = 0; i < staleCandidates.length; i++) {
     const model = staleCandidates[i];
@@ -1518,7 +1530,7 @@ async function testCandidateSet(candidates, now, prevMap, quality) {
       toTest.push(model);
     } else {
       const prev = prevMap.get(model.logicalName);
-      toCopy.push({ ...prev, ...model, checkedAt: now, pricingTier: pricingTierFor(model) });
+      toCopy.push({ ...prev, ...model, lastTestedAt: prev.lastTestedAt ?? null, checkedAt: now, pricingTier: pricingTierFor(model) });
     }
   }
 
