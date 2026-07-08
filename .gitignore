@@ -1,0 +1,44 @@
+# === Secrets & shell environment — NEVER commit ===
+.ssh/
+.profile
+.bashrc
+.bash_history
+.gitconfig
+.lesshst
+.cloud-locale-test.skip
+.claude.json
+.claude.json.bak-*
+
+# === Tool / config / credential directories ===
+.claude/
+.config/
+.codex/
+.gemini/
+.docker/
+.cloudflared/
+.openclaw/
+.opencode/
+.aider/
+.npm/
+.cache/
+.local/
+.bun/
+.agents/
+.agent-browser/
+.expo/
+.playwright-cli/
+
+# === Build transcripts & backups (bloat + may echo secrets) ===
+control-surface-plans/logs/
+control-surface-plans/backups/
+
+# === Scratch / test artifacts ===
+test-opencode/
+test-results/
+node_modules/
+
+# === Generic secret / noise patterns ===
+*.log
+*.env
+*.key
+*.pem

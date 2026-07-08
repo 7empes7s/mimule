@@ -1,0 +1,8 @@
+home insights audit admin
+incidents doctor infra jobs
+models gateway litellm cost traces feature-flags
+builder agents agent-team workflows brainstorm projects marketplace
+settings reports channels data-explorer about install status ratings
+governance security compliance governance-risk
+newsbites autopipeline scout content-health finance-intel dossier today
+opencode codex claude gemini

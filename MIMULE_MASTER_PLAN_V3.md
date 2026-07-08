@@ -2241,3 +2241,139 @@ EVIDENCE:
 
 NEXT:
 - Replace manual operator-token prompt with Entra-backed Cloudflare Access identity/session handling when ready.
+
+### 2026-05-16 13:18 UTC - Codex CLI
+STATUS:
+- Requeued Dashboard V4 Builder Month 6 Durable Workflow Engine after Claude quota exhaustion.
+
+CHANGES:
+- Created replacement Builder workflow `bw_7a8f91c5-95f3-4feb-b2b3-418d842b0781` using OpenCode-only free model configuration.
+- Started run `br_cec60be2-f942-46f2-8a6b-35238d98ba7b`.
+- Logged operational status in `/opt/ai-vault/daily/2026-05-16.md`.
+
+EVIDENCE:
+- First pass is running as `agent=opencode`, `model=opencode/qwen3.6-plus-free`.
+- Fallbacks are restricted to OpenCode-native free IDs: `opencode/qwen3.6-plus-free`, `opencode/deepseek-v4-flash-free`, `opencode/nemotron-3-super-free`, `opencode/minimax-m2.5-free`.
+- The pass stdout reports Phase 4 was already implemented from Claude's prior findings and moved to validation.
+
+NEXT:
+- Monitor the free-model run and continue Month 6 from Phase 5 once Phase 4 validation completes.
+
+### 2026-05-16 13:57 UTC - Codex CLI
+STATUS:
+- Monitored free-model Month 6 run `br_cec60be2-f942-46f2-8a6b-35238d98ba7b`; Pass 4 failed during Phase 8 validation with `failureClass=codex-exhausted`.
+
+EVIDENCE:
+- Passes 1-3 succeeded and completed Month 6 Phases 5-7.
+- Pass 4 verified Month 5 back-compat: run `br_6d964f7b-fabc-4ad6-a6a0-5cd0d5d34bd7` is readable through `/api/builder/runs`.
+- Pass 4 exposed a Phase 8 blocker: after `control-surface.service` was killed and restarted, the tmux session remained but the process inside was gone; the reconciler checked only tmux existence and did not resume/restart the pass.
+- Live DB had one test orchestrator instance for the failed run and `orchestrator_history` count `0`, so the history-row exit criterion is not met.
+- `control-surface.service` is active and `/health` returns `{"ok":true}` after cleanup.
+
+NEXT:
+- Patch Builder reconciliation to detect dead panes/processes inside existing tmux sessions.
+- Requeue Phase 8 validation using the free-model pool after that fix.
+
+### 2026-05-16 14:27 UTC - Codex CLI
+STATUS:
+- Completed Dashboard V4 Builder Month 6 Durable Workflow Engine.
+
+CHANGES:
+- Patched `/opt/opencode-control-surface/server/builder/runner.ts`:
+  - stale tmux sessions with no child process are detected and finalized instead of wedging,
+  - completed tmux sessions with recorded exit codes are finalized even if the session still exists,
+  - detached run processes are cleaned when a pane is stale,
+  - Builder pass completion records a single orchestrator pass result instead of replaying the generator loop.
+- Patched `/opt/opencode-control-surface/server/orchestrator/adapter.ts`:
+  - added `findInstanceByRunId()` for runs whose `builder_runs.orchestrator_instance_id` is missing,
+  - added `recordBuilderPassResult()` for one-pass-at-a-time history recording.
+- Marked all 44 items in `/root/BUILDER_MONTH6_ORCHESTRATOR_PLAN.md` complete.
+- Changed workflow `bw_7a8f91c5-95f3-4feb-b2b3-418d842b0781` from `auto-continue` to `once` after completion to stop no-op pass churn.
+
+EVIDENCE:
+- Builder run `br_e8568530-4406-44ab-aab1-fbdeab669dea` finished `success` with 3 successful passes.
+- Orchestrator instance `oi_ed051620-268b-4c35-8497-4f4f89324b99` finished `complete`, `current_step_index=4`, with sane history rows: `run-validation` plus 3 `spawn-pass` entries.
+- `bun test server/api/builder.test.ts` → 9 pass, 0 fail.
+- `bun test server/orchestrator/` → 16 pass, 0 fail.
+- `bun run build` → clean with the known Vite large-chunk warning.
+- `bun run typecheck` still reports only the 2 pre-existing baseline errors in `doctor.ts` and `actionDescriptors.ts`.
+- `control-surface.service` active; `/health` returns `{"ok":true}`.
+
+NEXT:
+- Month 6 is done. Remaining debt is outside this plan: fix the 2 pre-existing TypeScript errors and the pre-existing `today.test.ts` failures.
+
+### 2026-05-16 14:46 UTC - Codex CLI
+STATUS:
+- Completed the Dashboard V4 baseline stabilization debt left after Builder Month 6.
+- TypeScript now passes with no errors, and the previously failing `today.test.ts` suite is green.
+
+CHANGES:
+- Added optional `applied` typing to `/opt/opencode-control-surface/server/adapters/doctor.ts`.
+- Expanded the shared model `providerType` union in `/opt/opencode-control-surface/server/api/types.ts` to match current adapter output.
+- Updated `/opt/opencode-control-surface/server/api/today.test.ts` to unwrap the standard API envelope before payload assertions.
+
+EVIDENCE:
+- `bun run typecheck` -> pass.
+- `bun test server/api/today.test.ts` -> 9 pass, 0 fail.
+- `bun test server/api/actionDescriptors.test.ts` -> 4 pass, 0 fail.
+- `bun test server/db/ server/api/` -> 72 pass, 0 fail.
+- `bun run build` -> pass with known Vite large-chunk warning.
+- `control-surface.service` active; `/health` returns `{"ok":true}`.
+
+NEXT:
+- Dashboard baseline debt is clear. Choose the next orchestration slice from the V4 backlog or start Builder Month 7 planning.
+
+### 2026-05-16 14:55 UTC - Codex CLI
+STATUS:
+- Started Builder Platform Month 7 multi-tenant/project-aware work.
+- Created `/root/BUILDER_MONTH7_MULTITENANT_PLAN.md` and completed Phase 1: tenant context foundation.
+- Builder run `br_a8d9c2df-1dc3-4545-a476-1ad59d7e25b3` is marked failed due to automatic URL smoke checks returning `HTTP 000`, but the pass itself exited 0 and all command validations passed.
+
+CHANGES:
+- Added `/opt/opencode-control-surface/server/tenancy/context.ts`.
+- Added `/opt/opencode-control-surface/server/tenancy/context.test.ts`.
+- Added and seeded the `tenants` table in `/opt/opencode-control-surface/server/db/dashboard.ts`.
+- Updated `/opt/opencode-control-surface/server/db/dashboard.test.ts`.
+- Marked Phase 1 complete in `/root/BUILDER_MONTH7_MULTITENANT_PLAN.md`.
+
+EVIDENCE:
+- Builder pass `bp_c24a1603-1e01-4854-b554-3e81540606d6`: `opencode/qwen3.6-plus-free`, exit 0.
+- `bun run typecheck` -> pass.
+- `bun test server/tenancy/ server/db/dashboard.test.ts` -> 22 pass, 0 fail.
+- `bun test server/db/ server/api/` -> 74 pass, 0 fail.
+- `bun run build` -> pass with known Vite large-chunk warning.
+- `control-surface.service` restarted active; `/health` -> `{"ok":true}`.
+- Live SQLite tenant seed verified: `mimule|MIMULE|active`.
+
+NEXT:
+- Continue Month 7 Phase 2 with a workflow that leaves `internalUrl` and `publicUrl` null to avoid unintended URL-smoke failure.
+
+### 2026-06-18 09:27 UTC - Codex CLI
+STATUS:
+- Restored GaffrPro Builder visibility and launched a fresh fullstack Builder preview after the prior Claude session hit a rate limit.
+
+CHANGES:
+- Patched `/opt/opencode-control-surface/server/builder/store.ts` so project upserts return the actual existing `builder_projects.id` when a root conflict occurs.
+- Patched `/opt/opencode-control-surface/server/builder/brainstorm-orchestrator.ts` so Brainstormer-created workflows with a codebase path register/link to a real Builder project instead of `brainstorm-derived`.
+- Added regression coverage in `/opt/opencode-control-surface/server/builder/store.test.ts`.
+- Backed up `/var/lib/control-surface/dashboard.sqlite` to `/var/lib/control-surface/dashboard.sqlite.pre-gaffrpro-workflow-fix.20260618T092104Z`.
+- Migrated existing GaffrPro workflows `49f39602f5904ae5af9bf6fdc803a908` and `65eb2f43d49d4e1d8bf3db0347a50620` to project id `9e9f004771e1436cab82544484bbca23`.
+- Stopped stale GaffrPro Next preview processes on ports `4557`, `4559`, `4561`, and `4563`; shut down the old generated Docker stack.
+- Restarted `control-surface.service`.
+- Launched a fresh fullstack preview for workflow `65eb2f43d49d4e1d8bf3db0347a50620`.
+
+EVIDENCE:
+- `bun test server/builder/store.test.ts server/api/builder.test.ts server/builder/preview-server.test.ts` -> 25 pass, 0 fail.
+- `bun run check` in `/opt/opencode-control-surface` -> pass with known Vite large-chunk warning.
+- `pnpm exec prisma generate --schema apps/api/api/prisma/schema.prisma` -> generated Prisma Client v6.19.3.
+- `pnpm nx build api-api --skip-nx-cache` and `pnpm nx build web --skip-nx-cache` -> pass.
+- Builder API now returns both GaffrPro workflows with project id `9e9f004771e1436cab82544484bbca23`.
+- Fresh preview status: `ready`, `apiStatus=ok`, `webStatus=ok`, web `https://pins-midlands-licensing-sending.trycloudflare.com`, API `https://side-channels-firms-marilyn.trycloudflare.com`.
+- Public web routes `/`, `/squad`, `/fixtures`, `/leagues`, `/login` returned HTTP 200.
+- Public API `/api/v1/auth/providers` returned HTTP 200; public register/login returned HTTP 201/200; Postgres `User` count is 4.
+- `git diff --check` clean in `/opt/opencode-control-surface` and `/opt/provisioned/gaffrpro`.
+
+NEXT:
+- Use the fresh Builder preview links while the quick tunnels remain alive; relaunch from Builder if Cloudflare quick tunnel returns 1033 again.
+- Decide whether to commit the current Control Surface working tree, which contains both this fix and pre-existing uncommitted builder/security changes from the Claude session.
+- Clean or ignore generated GaffrPro artifacts (`BUILDER_DIR/`, `PASS_RESULT.json`, `*.tsbuildinfo`, `certs/`) before any future GaffrPro commit.
