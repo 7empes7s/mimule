@@ -44,10 +44,11 @@ STATE_FILE = "/var/lib/mimule/model-fallback-reprobe.json"
 BACKUP_DIR = "/etc/litellm"
 BACKUP_KEEP = 6
 
-PROBE_TIMEOUT = 12          # seconds per model
+PROBE_TIMEOUT = 30          # seconds per model
 PROBE_WORKERS = 10          # parallel probes (modest — avoid self-inflicted rate limiting)
 MIN_LIVE = 6                # abort rebuild if fewer than this answer 200 (bad probe / outage)
 KEEP_CODES = {200, 429, 500, 503}   # 200 live, 429 rate-limited (resets), 5xx transient
+HANG_STREAK = 3             # consecutive code-0 probes before pruning an incumbent
 
 LITELLM_TARGETS = ["editorial-heavy", "editorial-fast", "editorial-cloud-heavy",
                    "editorial-cloud-fast", "github-gpt41"]
@@ -139,13 +140,15 @@ def probe(model, key):
     req = urllib.request.Request(LITELLM_URL, data=body,
                                  headers={"Authorization": f"Bearer {key}",
                                           "Content-Type": "application/json"})
+    started = time.monotonic()
     try:
         with urllib.request.urlopen(req, timeout=PROBE_TIMEOUT) as r:
-            return model, r.status
+            code = r.status
     except urllib.error.HTTPError as e:
-        return model, e.code
+        code = e.code
     except Exception:
-        return model, 0            # timeout / connection / hang
+        code = 0                   # timeout / connection / hang
+    return model, code, int(round((time.monotonic() - started) * 1000))
 
 
 def build_pool(status):
@@ -236,18 +239,63 @@ def main():
     all_models = model_names()
     to_probe = [m for m in all_models if m not in LOCAL_OR_SPECIAL
                 and not re.search(r'prompt-guard|qianfan-ocr', m)]
+
+    # Previous state is best-effort: malformed/missing history seeds fresh records
+    # but never grants a hysteresis hold on this cycle.
+    prev_state = {}
+    try:
+        loaded = json.load(open(STATE_FILE))
+        if isinstance(loaded, dict):
+            prev_state = loaded
+    except Exception:
+        pass
+    prev = prev_state.get("pool", {})
+    if isinstance(prev, (list, set)):
+        prev_set = {m for m in prev if isinstance(m, str)}
+    elif isinstance(prev, dict):
+        prev_set = {m for m in prev if isinstance(m, str)}
+    else:
+        prev_set = set()
+    prev_history = prev_state.get("history", {})
+    if not isinstance(prev_history, dict):
+        prev_history = {}
+
     log(f"probing {len(to_probe)} cloud models (timeout {PROBE_TIMEOUT}s, {PROBE_WORKERS} workers){' [DRY-RUN]' if DRY else ''}")
 
     status = {}
+    pool_status = {}
+    history = {}
+    held = []
     with cf.ThreadPoolExecutor(max_workers=PROBE_WORKERS) as ex:
-        for m, code in ex.map(lambda mm: probe(mm, key), to_probe):
+        for m, code, ms in ex.map(lambda mm: probe(mm, key), to_probe):
             status[m] = code
+            pool_status[m] = code
+            observed_at = int(time.time())
+            old = prev_history.get(m)
+            valid_old = (isinstance(old, dict)
+                         and isinstance(old.get("code"), int) and not isinstance(old.get("code"), bool)
+                         and isinstance(old.get("streak"), int) and not isinstance(old.get("streak"), bool)
+                         and old.get("streak") >= 1
+                         and isinstance(old.get("since"), int) and not isinstance(old.get("since"), bool))
+            if valid_old and old["code"] == code:
+                streak = old["streak"] + 1
+                since = old["since"]
+            else:
+                streak = 1
+                since = observed_at
+            history[m] = {"code": code, "streak": streak, "since": since, "ms": ms}
+            if code == 0 and valid_old and streak < HANG_STREAK and m in prev_set:
+                pool_status[m] = 200
+                held.append(m)
 
     live = sorted(m for m, c in status.items() if c == 200)
     limited = sorted(m for m, c in status.items() if c == 429)
     dead = sorted(m for m, c in status.items() if c in (401, 404, 400, 402, 403))
     hang = sorted(m for m, c in status.items() if c == 0)
-    log(f"live(200)={len(live)}  limited(429)={len(limited)}  dead(4xx)={len(dead)}  hang(000)={len(hang)}")
+    held.sort()
+    log(f"live(200)={len(live)}  limited(429)={len(limited)}  dead(4xx)={len(dead)}  hang(000)={len(hang)} ({len(held)} held by hysteresis)")
+    if held:
+        log("HELD BY HYSTERESIS (kept in pool): " + ", ".join(held))
     if VERBOSE:
         log("LIVE: " + ", ".join(live))
 
@@ -255,7 +303,7 @@ def main():
         log(f"ABORT: only {len(live)} live (< {MIN_LIVE}) — probable outage / LiteLLM down; leaving chains unchanged")
         return 2
 
-    pool = build_pool(status)
+    pool = build_pool(pool_status)
     if len(pool) < MIN_LIVE:
         log(f"ABORT: rebuilt pool has {len(pool)} models (< {MIN_LIVE}); leaving chains unchanged")
         return 2
@@ -270,12 +318,6 @@ def main():
     gw_changed = new_gw.rstrip("\n") != cur_gw.rstrip("\n")
 
     # membership diff vs last run (for the log / state)
-    prev = {}
-    try:
-        prev = json.load(open(STATE_FILE)).get("pool", {})
-    except Exception:
-        prev = {}
-    prev_set = set(prev) if isinstance(prev, (list, set)) else set(prev.keys()) if isinstance(prev, dict) else set()
     promoted = sorted(set(pool) - prev_set)
     pruned = sorted(prev_set - set(pool))
 
@@ -300,7 +342,8 @@ def main():
     # persist state (probe snapshot + current pool) for the next diff
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
     json.dump({"ts": int(time.time()), "pool": pool, "live": live, "limited": limited,
-               "dead": dead, "hang": hang, "changed": bool(ll_changed or gw_changed)},
+               "dead": dead, "hang": hang, "changed": bool(ll_changed or gw_changed),
+               "history": history},
               open(STATE_FILE, "w"), indent=2)
 
     if ll_changed:
