@@ -13,7 +13,10 @@ Ordering follows the operator's provider priority:
 
 Design notes:
   * KEEP a model if it answers 200/429/500/503 (live or transiently limited — will recover).
-    PRUNE 401/404/400/402/403 (dead/renamed upstream) and 000 (hang/timeout — would stall a chain).
+    PRUNE terminal 400/401/402/403/404/410 immediately. Incumbent 000/408 timeout-like
+    failures require three consecutive observations before pruning.
+  * A model outside the pool requires three consecutive routable observations before promotion;
+    200/429/500/503 are one category, so provider throttling does not reset recovery evidence.
   * Ordering is by provider only (NOT by live-vs-429), so a 200<->429 flap does NOT churn the
     chain; only membership changes (a model dies or recovers) trigger an apply + LiteLLM restart.
   * Idempotent: if the rendered lines equal what's already on disk, nothing is written/restarted.
@@ -48,7 +51,10 @@ PROBE_TIMEOUT = 30          # seconds per model
 PROBE_WORKERS = 10          # parallel probes (modest — avoid self-inflicted rate limiting)
 MIN_LIVE = 6                # abort rebuild if fewer than this answer 200 (bad probe / outage)
 KEEP_CODES = {200, 429, 500, 503}   # 200 live, 429 rate-limited (resets), 5xx transient
-HANG_STREAK = 3             # consecutive code-0 probes before pruning an incumbent
+DEAD_CODES = {400, 401, 402, 403, 404, 410}  # terminal missing/auth/gone responses
+TIMEOUT_CODES = {0, 408}     # local timeout/connection failure or upstream request timeout
+TIMEOUT_STREAK = 3           # consecutive timeout-like probes before pruning an incumbent
+PROMOTE_STREAK = 3           # consecutive routable probes before promoting a non-incumbent
 
 LITELLM_TARGETS = ["editorial-heavy", "editorial-fast", "editorial-cloud-heavy",
                    "editorial-cloud-fast", "github-gpt41"]
@@ -151,8 +157,79 @@ def probe(model, key):
     return model, code, int(round((time.monotonic() - started) * 1000))
 
 
+def classify_probe_code(code):
+    """Map a raw probe result to the category used for membership hysteresis."""
+    if code in KEEP_CODES:
+        return "routable"
+    if code in DEAD_CODES:
+        return "dead"
+    if code in TIMEOUT_CODES:
+        return "timeout"
+    return "other"
+
+
+def _valid_history_record(record):
+    return (isinstance(record, dict)
+            and isinstance(record.get("code"), int) and not isinstance(record.get("code"), bool)
+            and isinstance(record.get("streak"), int) and not isinstance(record.get("streak"), bool)
+            and record.get("streak") >= 1
+            and isinstance(record.get("since"), int) and not isinstance(record.get("since"), bool))
+
+
+def advance_probe_history(previous, code, ms, observed_at):
+    """Return a history record whose streak follows categories, not exact HTTP codes."""
+    category = classify_probe_code(code)
+    if _valid_history_record(previous) and classify_probe_code(previous["code"]) == category:
+        streak = previous["streak"] + 1
+        since = previous["since"]
+    else:
+        streak = 1
+        since = observed_at
+    return {"code": code, "category": category, "streak": streak, "since": since, "ms": ms}
+
+
+def resolve_pool_observation(model, code, ms, prev_pool, prev_history, observed_at,
+                             has_pool_baseline=True):
+    """Return (history, effective pool code, decision) for one probe observation.
+
+    Terminal dead responses are always immediate. Timeout-like responses get incumbent-only
+    pruning hysteresis. Routable non-incumbents get symmetric promotion hysteresis. When no
+    previous pool baseline exists, routable observations bootstrap immediately so a missing or
+    corrupt state file cannot force the MIN_LIVE guard into a permanent empty-pool loop.
+    """
+    previous_record = prev_history.get(model)
+    has_valid_history = _valid_history_record(previous_record)
+    record = advance_probe_history(previous_record, code, ms, observed_at)
+    category = record["category"]
+    incumbent = model in prev_pool
+
+    if category == "dead":
+        return record, code, "pruned-dead"
+
+    if incumbent:
+        if category == "timeout":
+            # A missing/corrupt history file must never manufacture a hold. This
+            # preserves the original fail-safe behavior while valid legacy rows
+            # still seed the category-based timeout streak.
+            if not has_valid_history:
+                return record, code, "pruned-timeout-unseeded"
+            if record["streak"] < TIMEOUT_STREAK:
+                return record, 200, "held-timeout"
+            return record, code, "pruned-timeout"
+        return record, code, "kept" if category == "routable" else "excluded"
+
+    if category == "routable":
+        if not has_pool_baseline:
+            return record, code, "bootstrap-routable"
+        if record["streak"] >= PROMOTE_STREAK:
+            return record, code, "promoted"
+        return record, None, "pending-promotion"
+
+    return record, code, "excluded"
+
+
 def build_pool(status):
-    """Return the ordered list of models to place in fallback chains (dead/hanging pruned)."""
+    """Return the ordered list of models whose effective status is routable."""
     cand = [m for m, c in status.items()
             if c in KEEP_CODES and not is_weak(m) and 'codex' not in m
             and m not in LOCAL_OR_SPECIAL]
@@ -259,6 +336,7 @@ def main():
     prev_history = prev_state.get("history", {})
     if not isinstance(prev_history, dict):
         prev_history = {}
+    has_pool_baseline = bool(prev_set)
 
     log(f"probing {len(to_probe)} cloud models (timeout {PROBE_TIMEOUT}s, {PROBE_WORKERS} workers){' [DRY-RUN]' if DRY else ''}")
 
@@ -266,36 +344,33 @@ def main():
     pool_status = {}
     history = {}
     held = []
+    pending = []
+    observed_at = int(time.time())
     with cf.ThreadPoolExecutor(max_workers=PROBE_WORKERS) as ex:
         for m, code, ms in ex.map(lambda mm: probe(mm, key), to_probe):
             status[m] = code
-            pool_status[m] = code
-            observed_at = int(time.time())
-            old = prev_history.get(m)
-            valid_old = (isinstance(old, dict)
-                         and isinstance(old.get("code"), int) and not isinstance(old.get("code"), bool)
-                         and isinstance(old.get("streak"), int) and not isinstance(old.get("streak"), bool)
-                         and old.get("streak") >= 1
-                         and isinstance(old.get("since"), int) and not isinstance(old.get("since"), bool))
-            if valid_old and old["code"] == code:
-                streak = old["streak"] + 1
-                since = old["since"]
-            else:
-                streak = 1
-                since = observed_at
-            history[m] = {"code": code, "streak": streak, "since": since, "ms": ms}
-            if code == 0 and valid_old and streak < HANG_STREAK and m in prev_set:
-                pool_status[m] = 200
+            record, pool_code, decision = resolve_pool_observation(
+                m, code, ms, prev_set, prev_history, observed_at, has_pool_baseline)
+            history[m] = record
+            pool_status[m] = pool_code
+            if decision == "held-timeout":
                 held.append(m)
+            elif decision == "pending-promotion":
+                pending.append(m)
 
     live = sorted(m for m, c in status.items() if c == 200)
     limited = sorted(m for m, c in status.items() if c == 429)
-    dead = sorted(m for m, c in status.items() if c in (401, 404, 400, 402, 403))
+    dead = sorted(m for m, c in status.items() if c in DEAD_CODES)
     hang = sorted(m for m, c in status.items() if c == 0)
+    timed_out = sorted(m for m, c in status.items() if c == 408)
     held.sort()
-    log(f"live(200)={len(live)}  limited(429)={len(limited)}  dead(4xx)={len(dead)}  hang(000)={len(hang)} ({len(held)} held by hysteresis)")
+    pending.sort()
+    log(f"live(200)={len(live)}  limited(429)={len(limited)}  dead(terminal)={len(dead)}  "
+        f"hang(000)={len(hang)}  timeout(408)={len(timed_out)} ({len(held)} held by hysteresis)")
     if held:
         log("HELD BY HYSTERESIS (kept in pool): " + ", ".join(held))
+    if pending:
+        log("PENDING PROMOTION (needs 3 routable probes): " + ", ".join(pending))
     if VERBOSE:
         log("LIVE: " + ", ".join(live))
 
@@ -342,7 +417,8 @@ def main():
     # persist state (probe snapshot + current pool) for the next diff
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
     json.dump({"ts": int(time.time()), "pool": pool, "live": live, "limited": limited,
-               "dead": dead, "hang": hang, "changed": bool(ll_changed or gw_changed),
+               "dead": dead, "hang": hang, "timeout": timed_out,
+               "changed": bool(ll_changed or gw_changed),
                "history": history},
               open(STATE_FILE, "w"), indent=2)
 

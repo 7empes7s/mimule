@@ -4,10 +4,10 @@
  *
  * Modes:
  *   --mode=full  : every 6h, probe registry models, discover free-eligible cloud
- *                  models across providers, rewrite LiteLLM fallback chains
- *   --mode=quick : every 15m, re-check the last known-good cloud pool and
- *                  proactively rewrite chains; if the pool collapses, force a
- *                  full discovery pass immediately
+ *                  models across providers, and calculate fallback recommendations
+ *   --mode=quick : every 15m, re-check the last known-good cloud pool and refresh
+ *                  fallback recommendations; if the pool collapses, force a full
+ *                  discovery pass immediately
  *
  * Availability and quality are separate concerns:
  *   - availability: can the provider answer right now?
@@ -1224,7 +1224,10 @@ function addToLitellmConfig(model) {
   return true;
 }
 
-function rewriteFallbackChains(ranked) {
+// Produce the fallback recommendation stored in model-health.json. This function is
+// deliberately pure: model-fallback-reprobe.py is the sole owner of LiteLLM fallback
+// chain writes, while this health check may still register and hot-add new model entries.
+function buildFallbackPlan(ranked) {
   const dedupe = arr => [...new Set(arr.filter(Boolean))];
   const withoutPaid = arr => arr.filter(model => !PAID_LAST_RESORT_MODELS.has(model));
   const paidOnly = arr => arr.filter(model => PAID_LAST_RESORT_MODELS.has(model));
@@ -1288,29 +1291,14 @@ function rewriteFallbackChains(ranked) {
     "github-gpt4o-mini",
   ]);
 
-  // Map of pattern → replacement string for every chain in router_settings.fallbacks
-  const chains = [
-    [/- editorial-cloud-heavy:\s+\[[^\]]*\]/, `- editorial-cloud-heavy: [${cloudHeavyChain.join(", ")}]`],
-    [/- editorial-cloud-fast:\s+\[[^\]]*\]/,  `- editorial-cloud-fast:  [${cloudFastChain.join(", ")}]`],
-    [/- editorial-heavy:\s+\[[^\]]*\]/,       `- editorial-heavy: [${gpuHeavyFallback.join(", ")}]`],
-    [/- editorial-fast:\s+\[[^\]]*\]/,        `- editorial-fast:  [${gpuFastFallback.join(", ")}]`],
-    [/- routing-cheap:\s+\[[^\]]*\]/,         `- routing-cheap:   [${cheapFallback.join(", ")}]`],
-    [/- mimule-chat:\s+\[[^\]]*\]/,           `- mimule-chat:     [${chatFallback.join(", ")}]`],
-    [/- openrouter\/mimule-chat:\s+\[[^\]]*\]/, `- openrouter/mimule-chat: [${chatFallback.join(", ")}]`],
-  ];
-
-  let cfg = fs.readFileSync(LITELLM_CFG, "utf8");
-  const prevCfg = cfg;
-
-  for (const [pattern, replacement] of chains) {
-    cfg = cfg.replace(pattern, replacement);
-  }
-
-  const changed = cfg !== prevCfg;
-  if (changed) {
-    fs.writeFileSync(LITELLM_CFG, cfg, "utf8");
-  }
-  return { changed, heavyChain: cloudHeavyChain, fastChain: cloudFastChain, gpuHeavyFallback, gpuFastFallback };
+  return {
+    heavyChain: cloudHeavyChain,
+    fastChain: cloudFastChain,
+    gpuHeavyFallback,
+    gpuFastFallback,
+    cheapFallback,
+    chatFallback,
+  };
 }
 
 function loadPolicy() {
@@ -1733,8 +1721,7 @@ async function execute(mode, trigger = "manual") {
     console.log(`  ${capability}: ${models.length > 0 ? models.join(", ") : "(none available)"}`);
   }
 
-  const { changed: chainsChanged, heavyChain, fastChain, gpuHeavyFallback, gpuFastFallback } = rewriteFallbackChains(ranked);
-  await maybeRestartLiteLLM(chainsChanged, "fallback chain update", mode);
+  const { heavyChain, fastChain, gpuHeavyFallback, gpuFastFallback } = buildFallbackPlan(ranked);
 
   const lastFullCheckAt = mode === "full" ? now : (previous.lastFullCheckAt || now);
   const health = {
