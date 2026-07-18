@@ -22,8 +22,16 @@
 import fs from "node:fs";
 import { execSync, spawn } from "node:child_process";
 import { recalculateAllStatuses } from "/opt/mimoun/scripts/model-quality-writer.mjs";
+import {
+  ALLOWED_CREDENTIAL_ENV_NAMES,
+  acquireCredentialProbeLock,
+  probeCredentialHealth,
+  readCredentialHealthPrevious,
+  writeCredentialHealthAtomic,
+} from "./credential-health.mjs";
 
 const HEALTH_FILE         = "/var/lib/mimule/model-health.json";
+const CREDENTIAL_HEALTH_FILE = "/var/lib/mimule/credential-health.json";
 const QUALITY_FILE        = "/var/lib/mimule/model-quality.json";
 const POLICY_FILE         = "/etc/mimule/model-policy.json";
 const DISCOVERY_LOG_FILE  = "/var/lib/mimule/model-discovery-log.jsonl";
@@ -425,6 +433,53 @@ function writeJsonFile(filePath, data) {
 }
 
 const env = { ...loadEnvFile(LITELLM_ENV), ...loadEnvFile(AUTOPIPE_ENV) };
+
+async function refreshCredentialHealth(now) {
+  const probeLock = acquireCredentialProbeLock();
+  if (!probeLock.acquired) {
+    console.log("Credential health: another refresh is active");
+    return;
+  }
+
+  try {
+    const previous = readCredentialHealthPrevious(CREDENTIAL_HEALTH_FILE);
+    const minRefreshMs = 5 * 60 * 60 * 1000;
+    if (
+      previous
+      && Number.isFinite(previous.generatedAt)
+      && previous.generatedAt <= now
+      && now - previous.generatedAt < minRefreshMs
+    ) {
+      console.log("Credential health: recent observation retained");
+      return;
+    }
+
+    const document = await probeCredentialHealth({
+      configText: fs.readFileSync(LITELLM_CFG, "utf8"),
+      env,
+      previous,
+      now,
+    });
+    const forbiddenValues = [
+      ...ALLOWED_CREDENTIAL_ENV_NAMES.map(name => env[name]),
+      env.LITELLM_MASTER_KEY,
+    ].filter(value => typeof value === "string" && value.length > 0);
+    writeCredentialHealthAtomic(CREDENTIAL_HEALTH_FILE, document, forbiddenValues);
+
+    const counts = {};
+    for (const credential of Object.values(document.credentials)) {
+      counts[credential.status] = (counts[credential.status] || 0) + 1;
+    }
+    const summary = Object.entries(counts)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([status, count]) => `${status}=${count}`)
+      .join(", ");
+    console.log(`Credential health: ${Object.keys(document.credentials).length} checked${summary ? ` (${summary})` : ""}`);
+  } finally {
+    probeLock.release();
+  }
+}
+
 const LITELLM_KEY    = env.LITELLM_MASTER_KEY;
 const OPENROUTER_KEY = env.OPENROUTER_API_KEY;
 const GITHUB_TOKEN   = env.GITHUB_TOKEN;
@@ -1648,6 +1703,14 @@ async function execute(mode, trigger = "manual") {
   const prevMap = new Map((previous.models || []).map(model => [model.logicalName, model]));
   const quality = loadQuality();
   const policy = loadPolicy();
+
+  if (mode === "full") {
+    try {
+      await refreshCredentialHealth(now);
+    } catch {
+      console.warn("Credential health: refresh unavailable; model check continues");
+    }
+  }
 
   // Quick mode only runs if the last full check is fresh enough.
   if (mode === "quick" && (!previous?.lastFullCheckAt || now - previous.lastFullCheckAt > FULL_STALE_MS)) {

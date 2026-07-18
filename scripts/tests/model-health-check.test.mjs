@@ -80,3 +80,14 @@ test("fallback planner preserves deterministic recommendations without writing f
     chatFallback: ["free-medium", "free-heavy", "github-gpt4o-mini"],
   });
 });
+
+test("credential observations run only on full checks and cannot fail the model check", () => {
+  const callIndex = source.indexOf("await refreshCredentialHealth(now);");
+  assert.notEqual(callIndex, -1);
+  const guardIndex = source.lastIndexOf('if (mode === "full") {', callIndex);
+  assert.notEqual(guardIndex, -1);
+  assert.match(source.slice(guardIndex, callIndex + 40), /if \(mode === "full"\) \{\s*try \{\s*await refreshCredentialHealth\(now\);/);
+  assert.match(source, /Credential health: refresh unavailable; model check continues/);
+  assert.equal((source.match(/await refreshCredentialHealth\(now\);/g) ?? []).length, 1);
+  assert.match(source, /CREDENTIAL_HEALTH_FILE = "\/var\/lib\/mimule\/credential-health\.json"/);
+});
