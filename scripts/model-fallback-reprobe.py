@@ -26,13 +26,14 @@ Design notes:
   * The control-surface gateway re-reads its yaml every 60s (no restart needed). Local GPU models
     are never touched here (the GPU is off by operator decision; see project_gpu_off_free_cloud).
 
-Usage:  model-fallback-reprobe.py [--dry-run] [--verbose]
+Usage:  model-fallback-reprobe.py [--dry-run] [--verbose] [--ledger-report]
 """
 import concurrent.futures as cf
 import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -44,6 +45,7 @@ LITELLM_ENV = "/etc/litellm/litellm.env"
 GATEWAY_CONFIG = "/etc/tib-builder/gateway.yaml"
 LITELLM_URL = "http://127.0.0.1:4000/v1/chat/completions"
 STATE_FILE = "/var/lib/mimule/model-fallback-reprobe.json"
+LEDGER_DB = "/var/lib/control-surface/dashboard.sqlite"
 BACKUP_DIR = "/etc/litellm"
 BACKUP_KEEP = 6
 
@@ -55,6 +57,20 @@ DEAD_CODES = {400, 401, 402, 403, 404, 410}  # terminal missing/auth/gone respon
 TIMEOUT_CODES = {0, 408}     # local timeout/connection failure or upstream request timeout
 TIMEOUT_STREAK = 3           # consecutive timeout-like probes before pruning an incumbent
 PROMOTE_STREAK = 3           # consecutive routable probes before promoting a non-incumbent
+LEDGER_WINDOW_DAYS = 7       # production evidence window for route quarantine
+LEDGER_DEAD_MIN_CALLS = 20   # do not prune on a small or exploratory sample
+LEDGER_DEGRADED_MIN_CALLS = 5
+LEDGER_POLICY_VERSION = 1
+LEDGER_MODE = "shadow"       # observe three scheduled cycles before enabling prune enforcement
+LEDGER_TENANT_ID = os.environ.get("MIMULE_LEDGER_TENANT_ID", "mimule")
+LEDGER_IGNORED_BACKENDS = {"cli-direct"}
+# Destructive routing decisions use an allowlist. Historical unknown includes
+# pre-infra-retry restart casualties; server_error is unsafe until the broad
+# classifyError("5") fallback is repaired in the Control Surface.
+LEDGER_ATTRIBUTABLE_ERROR_CLASSES = {"rate_limit", "auth", "timeout", "unavailable"}
+LEDGER_EARNED_MIN_CALLS = 50
+LEDGER_EARNED_MIN_RATE = 0.60
+LEDGER_RATE_LIMIT_MIN_SPAN_HOURS = 48
 
 LITELLM_TARGETS = ["editorial-heavy", "editorial-fast", "editorial-cloud-heavy",
                    "editorial-cloud-fast", "github-gpt41"]
@@ -75,6 +91,7 @@ LOCAL_OR_SPECIAL = {'editorial-heavy', 'editorial-fast', 'routing-cheap', 'mimul
 
 DRY = "--dry-run" in sys.argv
 VERBOSE = "--verbose" in sys.argv or DRY
+LEDGER_REPORT = "--ledger-report" in sys.argv
 
 
 def log(msg):
@@ -243,6 +260,165 @@ def build_pool(status):
     return full
 
 
+def _empty_ledger_decisions(now_ms):
+    as_of = datetime.fromtimestamp(now_ms / 1000, timezone.utc).isoformat().replace("+00:00", "Z")
+    return {
+        "policy_version": LEDGER_POLICY_VERSION,
+        "mode": LEDGER_MODE,
+        "enforced": False,
+        "as_of": as_of,
+        "models": {},
+        "would_prune": [],
+        "would_quarantine": [],
+        "would_limit_tail": [],
+    }
+
+
+def ledger_route_decisions(db_path=LEDGER_DB, now_ms=None):
+    """Return guarded R2a route decisions from trusted production evidence.
+
+    The Control Surface ledger is opened read-only. CLI-direct traffic is outside the
+    fallback router. Only successes and an explicit model-attributable failure allowlist
+    count toward the recent sample or earned-history shield. The caller decides how to fail
+    open if the ledger is absent or unreadable.
+
+    Unearned zero-success routes become prune candidates. Earned routes are reported as a
+    shadow quarantine only; R2b must define their recovery/canary exit before enforcement.
+    """
+    effective_now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    cutoff_ms = effective_now_ms - LEDGER_WINDOW_DAYS * 86400 * 1000
+    backend_placeholders = ", ".join("?" for _ in LEDGER_IGNORED_BACKENDS)
+    error_placeholders = ", ".join("?" for _ in LEDGER_ATTRIBUTABLE_ERROR_CLASSES)
+    trusted_predicate = f"""
+        backend NOT IN ({backend_placeholders})
+        AND (tenant_id IS NULL OR tenant_id = ?)
+        AND resolved_model != ''
+        AND (error_class IS NULL OR error_class != 'gateway_unreachable')
+        AND (success = 1 OR (success = 0 AND error_class IN ({error_placeholders})))
+    """
+    recent_query = f"""
+        SELECT resolved_model AS model,
+               COUNT(*) AS attributable_calls,
+               SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS successes,
+               SUM(CASE WHEN error_class = 'rate_limit' THEN 1 ELSE 0 END) AS rate_limits,
+               SUM(CASE WHEN error_class = 'auth' THEN 1 ELSE 0 END) AS auth_failures,
+               SUM(CASE WHEN error_class = 'timeout' THEN 1 ELSE 0 END) AS timeouts,
+               SUM(CASE WHEN error_class = 'unavailable' THEN 1 ELSE 0 END) AS unavailable_failures,
+               MIN(ts) AS first_ts,
+               MAX(ts) AS last_ts
+        FROM gateway_calls
+        WHERE ts >= ?
+          AND {trusted_predicate}
+        GROUP BY resolved_model
+        HAVING COUNT(*) >= ?
+           AND SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) = 0
+        ORDER BY resolved_model
+    """
+    all_time_query = f"""
+        SELECT resolved_model AS model,
+               COUNT(*) AS attributable_calls,
+               SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS successes
+        FROM gateway_calls
+        WHERE {trusted_predicate}
+        GROUP BY resolved_model
+    """
+    trusted_params = [*sorted(LEDGER_IGNORED_BACKENDS), LEDGER_TENANT_ID,
+                      *sorted(LEDGER_ATTRIBUTABLE_ERROR_CLASSES)]
+    recent_params = [cutoff_ms, *trusted_params, LEDGER_DEGRADED_MIN_CALLS]
+    connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
+    try:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only = ON")
+        connection.execute("PRAGMA busy_timeout = 2000")
+        all_time = {
+            row["model"]: (row["attributable_calls"], row["successes"])
+            for row in connection.execute(all_time_query, trusted_params)
+        }
+        decisions = _empty_ledger_decisions(effective_now_ms)
+        for row in connection.execute(recent_query, recent_params):
+            model = row["model"]
+            span_hours = (row["last_ts"] - row["first_ts"]) / (3600 * 1000)
+            all_calls, all_successes = all_time.get(model, (0, 0))
+            all_rate = (all_successes / all_calls) if all_calls else 0.0
+            earned = all_calls >= LEDGER_EARNED_MIN_CALLS and all_rate >= LEDGER_EARNED_MIN_RATE
+            credential_or_quota = row["auth_failures"] > 0 or row["rate_limits"] > 0
+            if earned:
+                if row["attributable_calls"] < LEDGER_DEGRADED_MIN_CALLS or not credential_or_quota:
+                    continue
+                action = "shadow-quarantine"
+                state = "degraded"
+                target_list = "would_quarantine"
+                reason = (
+                    f"earned {all_successes}/{all_calls} trusted calls, now 0/{row['attributable_calls']} "
+                    f"in {LEDGER_WINDOW_DAYS}d on credential/quota failures; recovery policy not yet enforced"
+                )
+            else:
+                if row["attributable_calls"] < LEDGER_DEAD_MIN_CALLS:
+                    continue
+                # R2b owns mixed throttling decay. R2a only proposes a rate-limit prune
+                # when every trusted failure is 429 and the evidence spans 48 hours.
+                if row["rate_limits"] > 0:
+                    rate_limit_only = row["rate_limits"] == row["attributable_calls"]
+                    if not rate_limit_only or span_hours < LEDGER_RATE_LIMIT_MIN_SPAN_HOURS:
+                        continue
+                action = "shadow-prune"
+                state = "dead"
+                target_list = "would_prune"
+                reason = (
+                    f"never earned a working record; 0/{row['attributable_calls']} trusted calls "
+                    f"in {LEDGER_WINDOW_DAYS}d"
+                )
+            decisions["models"][model] = {
+                "state": state,
+                "action": action,
+                "reason": reason,
+                "evidence": {
+                    "recentCalls": row["attributable_calls"],
+                    "recentSuccesses": row["successes"],
+                    "recentFirstTs": row["first_ts"],
+                    "recentLastTs": row["last_ts"],
+                    "recentSpanHours": round(span_hours, 1),
+                    "rateLimitFailures": row["rate_limits"],
+                    "authFailures": row["auth_failures"],
+                    "timeoutFailures": row["timeouts"],
+                    "unavailableFailures": row["unavailable_failures"],
+                    "allTimeCalls": all_calls,
+                    "allTimeSuccesses": all_successes,
+                    "allTimeSuccessRate": round(all_rate, 4),
+                },
+            }
+            decisions[target_list].append(model)
+        return decisions
+    finally:
+        connection.close()
+
+
+def load_ledger_decisions(db_path=LEDGER_DB, now_ms=None):
+    """Fail-open wrapper for the scheduled routing path."""
+    effective_now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    try:
+        return ledger_route_decisions(db_path, effective_now_ms), None
+    except (OSError, sqlite3.Error, ValueError) as error:
+        return _empty_ledger_decisions(effective_now_ms), type(error).__name__
+
+
+def apply_ledger_decisions(pool_status, ledger_decisions):
+    """Return a copy with only policy-approved destructive decisions enforced."""
+    reconciled = dict(pool_status)
+    for model in ledger_decisions.get("would_prune", []):
+        if model in reconciled:
+            reconciled[model] = None
+    return reconciled
+
+
+def reconcile_pool_with_ledger(pool_status, ledger_decisions, mode=LEDGER_MODE):
+    """Apply only explicitly enabled decisions and report the effective prune set."""
+    if mode != "enforce-prune":
+        return dict(pool_status), set()
+    enforced = set(ledger_decisions.get("would_prune", []))
+    return apply_ledger_decisions(pool_status, ledger_decisions), enforced
+
+
 def splice_litellm(pool, dead=frozenset()):
     lines = open(LITELLM_CONFIG).read().split("\n")
     start = next(i for i, l in enumerate(lines) if l.strip() == "fallbacks:")
@@ -312,6 +488,15 @@ def backup(path, tag):
 
 def main():
     t0 = time.time()
+    observed_at = int(time.time())
+    if LEDGER_REPORT:
+        ledger_decisions, ledger_error = load_ledger_decisions(now_ms=observed_at * 1000)
+        if ledger_error:
+            log(f"ERROR: ledger report unavailable ({ledger_error})")
+            return 2
+        print(json.dumps(ledger_decisions, indent=2, sort_keys=True))
+        return 0
+
     key = load_master_key()
     all_models = model_names()
     to_probe = [m for m in all_models if m not in LOCAL_OR_SPECIAL
@@ -345,7 +530,6 @@ def main():
     history = {}
     held = []
     pending = []
-    observed_at = int(time.time())
     with cf.ThreadPoolExecutor(max_workers=PROBE_WORKERS) as ex:
         for m, code, ms in ex.map(lambda mm: probe(mm, key), to_probe):
             status[m] = code
@@ -378,12 +562,30 @@ def main():
         log(f"ABORT: only {len(live)} live (< {MIN_LIVE}) — probable outage / LiteLLM down; leaving chains unchanged")
         return 2
 
+    # Production outcomes outrank a synthetic probe. The ledger read is deliberately
+    # fail-open: an unavailable observability database must never destroy a working pool.
+    ledger_decisions, ledger_error = load_ledger_decisions(now_ms=observed_at * 1000)
+    if ledger_error:
+        log(f"WARN: ledger reconciliation unavailable ({ledger_error}); using probe evidence only")
+    if ledger_decisions["would_prune"]:
+        detail = ", ".join(
+            f"{model} (0/{ledger_decisions['models'][model]['evidence']['recentCalls']} in {LEDGER_WINDOW_DAYS}d)"
+            for model in ledger_decisions["would_prune"]
+        )
+        log("LEDGER SHADOW PRUNE (not enforced): " + detail)
+    if ledger_decisions["would_quarantine"]:
+        log("LEDGER SHADOW QUARANTINE (not enforced): " + ", ".join(ledger_decisions["would_quarantine"]))
+
+    # R2a starts in shadow mode. Once three scheduled cycles agree on the exact
+    # decision set, a separate reviewed slice can enable prune-only enforcement.
+    pool_status, enforced_ledger_prunes = reconcile_pool_with_ledger(
+        pool_status, ledger_decisions, LEDGER_MODE)
     pool = build_pool(pool_status)
     if len(pool) < MIN_LIVE:
         log(f"ABORT: rebuilt pool has {len(pool)} models (< {MIN_LIVE}); leaving chains unchanged")
         return 2
 
-    new_ll = splice_litellm(pool, dead=set(dead))
+    new_ll = splice_litellm(pool, dead=set(dead) | enforced_ledger_prunes)
     new_gw = splice_gateway(pool)
     validate_litellm(new_ll)              # raises on bad YAML / dangling ref
 
@@ -418,6 +620,7 @@ def main():
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
     json.dump({"ts": int(time.time()), "pool": pool, "live": live, "limited": limited,
                "dead": dead, "hang": hang, "timeout": timed_out,
+               "ledger_decisions": ledger_decisions,
                "changed": bool(ll_changed or gw_changed),
                "history": history},
               open(STATE_FILE, "w"), indent=2)
