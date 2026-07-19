@@ -1,75 +1,146 @@
-# FABLE HANDOVER — MIMULE Control Surface: fix everything, finish everything
+# Claude Fable handover — model discovery and unified Agent Workspace
 
-You are Fable (claude-fable-5), taking over as the single planner + builder + verifier + shipper for the **MIMULE Control Surface** at `/opt/opencode-control-surface/` (Bun + TypeScript server in `server/`, Vite + React + wouter frontend in `app/`), LIVE at https://control.techinsiderbytes.com, systemd unit `control-surface.service` (`bun run server/index.ts`, port 3000). Server-code changes require a service restart; frontend is served from `dist/` after `vite build` (part of `bun run check`).
+**Prepared:** 2026-07-19 UTC
+**Status:** continuation contract; verify every runtime fact before acting
+**Role:** Claude Fable researches, plans, decomposes, delegates, reviews, integrates, logs, and reports. GPT Terra or Sonnet 5 writes production code in bounded isolated worktrees.
 
 ## Mission
-Fix all open issues and drive the Control Surface to **completion and production perfection**: every planned phase shipped or honestly skipped-with-reason, every page consistent and mobile-flawless, zero silent behaviors, zero fake data, everything verified live with evidence. **Quality and keep-it-running outrank speed.** You are pre-authorized to commit to master and restart `control-surface.service` after YOU have verified a slice green — do not pause to ask between green slices (full-auto: green → commit → restart → live-verify → advance; red → fix). Slice the work so an interruption only ever lands BETWEEN slices, never mid-build.
 
-## Read first (in order, before any edit)
-1. `/root/CLAUDE.md` — system map, service table, safety rules.
-2. `/home/agent/MIMULE_MASTER_PLAN_V3.md` — authoritative continuation file; follow its Append Protocol after every session.
-3. `/root/DASHBOARD_V5_PLAN.md` — the V5 phase plan (tick items as you ship them).
-4. `/root/control-surface-plans/` — `BUILD_LOG.md` (append per slice), `_NEXT.md` (staged task specs, currently the mobile style pass), `UX_STYLING_PASS_PLAN.md` (table standard), `pages/<page>.plan.md` (READ the page plan before touching any page).
-5. `/opt/ai-vault/daily/2026-07-02.md` — latest session context.
-6. `git -C /opt/opencode-control-surface log --oneline -15` and `git stash list`.
+Continue the MIMULE / TechInsiderBytes Control Surface program without losing any operator requirement or weakening its evidence rules. The two active tracks are:
 
-## Current state (2026-07-02 ~15:00 UTC — verify, don't assume)
-- HEAD = `94f1428` on master, **live and verified**: (a) incidents auto-close visibility (autoClosed/resolutionSource/autoCloseReason/autoCloseAt derived from the `action_audit` `incidents.auto-close` trail — no schema change; gray "auto-closed" pill + "Auto-closed by system" callout + filterable), (b) `sanitizePostMortemSuggestion()` in `server/api/incidents.ts` — strips `<think>`/`<reasoning>`, rejects reasoning-shaped text, falls back to the deterministic template. **Do not regress either.** Live proof exists in the audit ledger (pre-fix `source=ai len=1160` leak at 14:11; post-fix `source=template len=511` at 14:59).
-- `git stash@{0}` holds **incomplete (self-reported 76%) autonomous V5 Phase-6 builder work** across ~11 files: a genuinely useful `server/lib/atomicJson.ts` (+test) atomic-read race fix for model-health JSON, and a half-built **incident mute/snooze feature** (`muted_at/muted_by/mute_reason` columns, `/api/incidents/:id/mute`, descriptors/executor/router/UI touches). Salvage deliberately (see backlog item 1) — do NOT blind-apply.
-- The autonomous improvement engine is **OFF by operator decision**: `mimule-jobd.service` and `mimule-project-improve.timer` disabled (also inactive: mimule-orchestrator/overseer/project-improve). **Keep them off — YOU are the only builder.** Before ANY git operation, `ps`-check for stray builders (`codex exec`, `--dangerously-bypass-approvals`, opencode run, "BUILD engineer" claude loops); if found, stop by PID only and note it.
-- Model-routing self-healing is live: `model-fallback-reprobe.timer` (every 3h at :17) runs `/opt/mimoun/scripts/model-fallback-reprobe.py`, re-probing all cloud models and rebuilding BOTH the LiteLLM editorial fallbacks (`/etc/litellm/config.yaml`) and the CS gateway chains (`/etc/tib-builder/gateway.yaml`). **Don't break it; don't hand-edit chains it manages** (it will rewrite them). State: `/var/lib/mimule/model-fallback-reprobe.json`; `--dry-run` to preview.
-- GPU (Vast RTX 3090) is **off by operator choice** — cloud-first. Do NOT try to fix/restart the GPU or lead routing with local models. Local logical models are capped 8s fail-fast on purpose.
-- Zen provider caveat: only ~2 of 42 zen models work (upstream deprecation, same key) — don't chase a key fix.
-- SQLite: `/var/lib/control-surface/dashboard.sqlite` (`DASHBOARD_DB=1`); secrets in `/etc/control-surface/secrets.env` (never echo values; load like `TOKEN=$(grep -E '^OPERATOR_TOKEN=' /etc/control-surface/secrets.env | cut -d= -f2-)`). Mutating API routes need `x-operator-token`.
+1. trustworthy provider catalogs, credential health, free-model admission, and redemption; and
+2. a persistent all-in-one Agent Workspace for Terminal, Codex, OpenCode, Claude, and Gemini.
 
-## Ordered backlog — do ALL of it
-0. **Ground + health sweep**: read the files above; `systemctl is-active control-surface litellm newsbites-autopipeline`; confirm no stray builders; confirm clean tree at `94f1428`+.
-1. **Salvage `stash@{0}`** (in a scratch branch, never on live master directly): apply, split into (a) `atomicJson` race fix — finish, test, ship; (b) incident **mute/snooze** — complete it properly end-to-end (schema migration done right, executor + descriptors + router + UI + tests + "never silent" audit trail), ship; (c) discard only what is broken/duplicated, and record what was discarded and why in BUILD_LOG. Then drop the stash.
-2. **Finish V5 Phase 6 leftovers** (from the builder's own PASS_RESULT): OpenCode session-count widget; widget hide/reorder; Vast host sampler timer — but the GPU is off, so the sampler must **honestly degrade** ("GPU off by operator" state, not fake metrics, not red noise).
-3. **Mobile style pass** — the staged spec in `/root/control-surface-plans/_NEXT.md`: screenshot-driven, app+CSS only, fix at the SHARED/CSS level so one media-query fix benefits many pages. Operator verbatim: "a lot of style issues especially with mobile view." Verify with multi-viewport Playwright (Desktop / Tablet / iPhone 16 Pro) across ALL routes; zero console errors, all 2xx.
-4. **UX table standard everywhere** (`UX_STYLING_PASS_PLAN.md`): ALL tables share ONE behavior — pagination + page-size, sorting, search/filter, row-expand reveal (never-silent details), consistent padding/borders. Audit every route; fix stragglers.
-5. **V5 phases 14–17, grounded subset only**, in the operator-approved order **P15 feature-flags → P17 security → P14 RBAC → P16 model-lifecycle**: ship only what fits a single-VPS stack; render honest "not configured" for the rest; maintain an explicit skip-list in the plan. Never fake capability.
-6. **Universal AI discovery (G9, zero-config)**: the CS must auto-discover ALL AI systems in ANY environment (processes, ports, configs, containers) — discover → flag → Register flow. No hardcoded MIMULE inventory assumptions anywhere.
-7. **Self-learning remediation loop, next slices**: incident auto-close (done) → auto-close visibility (done) → continue: recurrence detection (same finding re-opens within N days ⇒ escalate, link incidents), auto-close for non-sentinel detector findings where a re-scan can prove the condition cleared, and surface remediation-loop stats on the incidents page. Every automated action must be visible in UI + `action_audit` ("never silent").
-8. **Full page-vs-plan audit**: for every route, diff reality against `pages/<page>.plan.md`; fix every gap or mark it skipped-with-reason in the plan. Trustworthy empty/error/loading states everywhere.
-9. **Final hardening pass**: full `bun test` green; `bun run check` green; multi-viewport visual pass all routes; health score reflects REAL findings only (stale-finding de-noise stays fixed — recency bounds, no oneshot false positives); docs (BUILD_LOG, V5 plan, master plan, vault) truthful and current.
+Do not interpret “copy the competition” as copying proprietary source. Reproduce the useful behavior and workflow patterns in an original implementation, and improve them where MIMULE needs stronger ownership, security, traceability, or operator control.
 
-## Per-slice protocol (every slice, no exceptions)
-1. Write/READ the slice spec; smallest independently shippable unit.
-2. Build it. You write the code yourself (you are the capable model — the operator explicitly banned free-model code: "the free models make too many mistakes"). You may parallelize with Sonnet 5 subagents for independent slices; never with free models.
-3. Verify with EVIDENCE, never claims: `bun run check` (tsc + vite build) → targeted `bun test <files>` → ephemeral smoke for any server change: temp DB + alt port (e.g. 3199 — check `ss -ltn` first), curl the endpoints, inspect rows, then `kill <PID>` (the specific PID only) and remove the temp DB.
-4. Commit to master with a precise message (never commit secrets; check `git status` for entangled files first — commit ONLY your slice's files).
-5. `systemctl restart control-surface.service` → `systemctl is-active` → `journalctl -u control-surface.service -n 10` → curl the live endpoint(s) → if UI changed, multi-viewport visual check.
-6. Log: append to `/root/control-surface-plans/BUILD_LOG.md` (files, commands, results, verified, pending), tick `/root/DASHBOARD_V5_PLAN.md`, append `/opt/ai-vault/daily/<YYYY-MM-DD>.md`, and append the master plan per its protocol. Keep docs truthful.
-7. Advance to the next slice without asking.
+## Operating model
 
-## Operator's standing goals — never violate, never forget
-1. **Quality + keep-running outrank speed.** A "done" that isn't live and working is not done.
-2. **Never make the operator the monitor** — the system verifies itself and surfaces its own failures (Product Health Sentinel philosophy). Team owns live-product health.
-3. **"Never silent"**: every automated action visible in the UI with an audit trail; row-expand reveals must never hide info silently.
-4. **Honest UI**: "not configured" over fake data; would-an-insider-roll-their-eyes credibility bar; no speculative widgets/fields "just in case" — build only what's needed now.
-5. **Model routing**: logical model names ONLY (never hardcode backends); `/etc/litellm/config.yaml` is authoritative; free models FIRST in runtime chains, paid LAST (paid = free-daily-quota extenders); maximally BROAD cross-provider fallback chains; provider cycling (never top up when free alternatives exist); the reprobe automation owns chain maintenance.
-6. **Cloud-first while GPU is off** (operator decision) — local is fallback, don't lead with it, don't "fix" the GPU.
-7. **Capable models write code** (you / Sonnet 5 / Codex) — free models never write production code, never plan.
-8. **Verify before claiming done — always show evidence** (command output, row counts, live curl, screenshots).
-9. **Governance is a product feature**, not a brake: M365-admin-center-but-smarter — audit/security/RBAC with one-click AI-doctor fixes. Long-term, the CS is a sellable product (multi-project, multi-tenant) — build with productization in mind.
-10. **Log every meaningful session** to the AI Vault daily file + master plan; this is mandatory.
-11. **Keep the autonomous improvement engine off**; you are the only builder. If you find concurrent builders, stop them by PID and continue — never let two builders share the tree.
+- Fable is the orchestrator and research lead. Ground each slice in the current repository, current primary documentation, and verified live state.
+- Delegate implementation only to **GPT Terra or Sonnet 5**, one bounded task and file scope at a time, preferably in a detached worktree.
+- Keep review bounded. Fable runs the objective acceptance gates itself. Use at most one separate GPT Terra or Sonnet 5 adversarial pass when a slice is security-sensitive, production-mutating, or its specification explicitly requires one; fix concrete findings, rerun the gates once, and ship or stop. Do not create an open-ended review loop.
+- Fable reconciles the shared tree, runs the final gates itself, commits only intended paths, deploys only when authorized, verifies live evidence, and logs the result.
+- Never let two builders write the same checkout. Preserve unrelated dirty files.
 
-## Hard safety rules (absolute)
-- **NEVER touch `/opt/newsbites`, `/opt/mimoun`, `/opt/paperclip`, `/opt/backups`** except read-only. NewsBites is a LIVE product.
-- **NEVER broad `pkill -f`** — it has killed live services here before. Kill by specific PID/port only. `pkill -f 'bun run server/index.ts'` would kill the live Control Surface.
-- **Never commit `.env`/`.key`/`.pem`/secrets; never echo secret values** into logs or output.
-- **Never force-push; never rewrite master history.** Before any `git reset/checkout/stash`, ps-check for concurrent builders and inspect what the dirty files ARE — never treat unknown work as disposable; preserve (stash with a descriptive message) rather than discard.
-- Restart the live service only after a green verification; always check the journal after restart.
-- If usage limits threaten, finish and land the current slice, log state cleanly, and stop BETWEEN slices — never mid-build.
+## Read first
 
-## Definition of "completion and perfection"
-- Every backlog item above shipped and live-verified, or explicitly skipped-with-reason in the plan (honest skip-list).
-- Full `bun test` green; `bun run check` green; every route 2xx with zero console errors on Desktop/Tablet/iPhone.
-- Health score green from real findings only; incidents lifecycle fully self-healing AND fully visible (auto-close + visibility + mute + recurrence).
-- Every page matches its `pages/*.plan.md` or the plan says why not.
-- No regressions on: incidents auto-close visibility, the post-mortem sanitizer, the reprobe automation, gateway fallback chains, table UX standard.
-- BUILD_LOG, V5 plan, master plan, and vault all truthful and current — a cold reader could take over from your docs alone.
+1. `/root/AGENTS.md`
+2. `/root/CLAUDE.md`
+3. `/home/agent/MIMULE_MASTER_PLAN_V3.md`
+4. `/root/README.md`
+5. `/root/control-surface-plans/REPAIR_PLAN_MODEL_ROUTING.md`
+6. `/root/control-surface-plans/tasks/SPEC_48_CREDENTIAL_HEALTHCHECK.md`
+7. `/root/control-surface-plans/tasks/SPEC_49_MODEL_CATALOG_DISCOVERY_AND_REDEMPTION.md`
+8. `/root/control-surface-plans/OMNIROUTE_INTEGRATION_PLAN.md`
+9. `/root/control-surface-plans/ALL_IN_ONE_AGENT_WORKSPACE_PLAN.md`
+10. `/opt/opencode-control-surface/README.md`
+11. the latest entry in `/opt/ai-vault/daily/<UTC-date>.md`
+12. current status, log, remotes, branches, worktrees, services, and timers in every repository you will touch
 
-Begin with backlog item 0 now.
+## Operator requirements — preserve all of them
+
+### Models and providers
+
+- Check AIHubMix at `https://aihubmix.com` and its documented backup `https://api.inferera.com`.
+- Keep the supplied AIHubMix credential in a root-readable server environment only. Never put its value in Git, plans, logs, prompts, process arguments, browser state, or this handover. Recommend rotation because it was pasted into chat.
+- Discover AIHubMix’s free text/chat models, but add only models that return a substantive bounded completion. A catalog price of zero, a list response, HTTP 200, or a canned quota/balance message is not enough.
+- Treat AIHubMix and inferera as one provider identity, not two independent redundancy domains.
+- Scan the complete supported catalog for every existing provider and detect additions, removals, schema changes, capability changes, and price/eligibility drift.
+- Harden discovery so partial, malformed, implausibly collapsed, stale, or oversized catalogs cannot erase healthy models or invent authoritative removals.
+- Separate provider catalog presence, policy eligibility, credential validity, and substantive model success.
+- Check credential health with model health so an expired or exhausted key does not make a good model look permanently dead.
+- Give temporarily blocked, degraded, or automatically quarantined models bounded full-scan redemption opportunities when the current complete catalog still lists their exact identity.
+- Manual force-blocks remain authoritative. Quick scans cannot run an uncapped redemption cohort. Catalog-absent routes cannot escape through a generic stale path.
+- A recovered route needs current substantive success; fallback promotion needs its configured consecutive-success evidence. Rate limits and 5xx responses do not build promotion evidence.
+- Prevent surprise billing: auto-discovered free routes that later become paid or ineligible are quarantined from the free rotation. Incomplete evidence cannot create a destructive decision.
+- Preserve exact provider/model identity and distinguish it from the logical LiteLLM route.
+
+### OmniRoute and comparable projects
+
+- Continue evaluating `diegosouzapw/OmniRoute` as a semi-trusted, loopback-only leaf behind LiteLLM, never as the routing authority.
+- OmniRoute may eventually be shared. It must not receive personal keys, reused passwords, personal information, or private prompts during the first phase.
+- Use only manifest-approved truly keyless providers initially. Any later provider credential must be new, dedicated, minimally scoped, independently revocable, and separate from personal/LiteLLM keys.
+- Pin source and image digests, require authentication, encrypt stored credentials, sandbox the process/container, bind locally, scope every consumer key, and keep dashboard/admin paths private.
+- OmniRoute Phase 1 is plan-only until separately authorized. Start with synthetic/public prompts and one reviewed keyless adapter.
+- Research Arena AI, Mammouth AI, Lookatmy.ai, Portkey, and other relevant gateways/workspaces from primary sources.
+- Do not scrape consumer-only products to manufacture an API integration. At the 2026-07-18 observation, Arena’s developer API was authenticated/credit-billed, Mammouth exposed no zero-input-and-output-price catalog entries, and Lookatmy.ai had no documented public developer API.
+- Adopt the best workflow, routing, observability, isolation, and control ideas from competitors when they are better than MIMULE’s current behavior. Record each adopted behavior as a delivery slice with an executable acceptance test.
+
+### Terminal and all-in-one Agent Workspace
+
+- Replace the current one-session terminal experience with multiple persistent terminal sessions.
+- Sessions must remain alive while the operator navigates elsewhere, support collapse/restore, tabs/splits, reconnect, retained output, exact stop, and server-enforced writer leases.
+- Study and plan the merger of Terminal, Codex, OpenCode, Claude, and Gemini pages into one GUI/CLI workspace.
+- Preserve each harness’s real capabilities through adapters; do not reduce everything to a lowest common denominator.
+- Provide complete, capability-aware model and inference control: exact model, fallback, auto, compare, reasoning effort/budget, variant, temperature/top-p, output/context limits, tools/MCP, modalities, sandbox, network, and approval profile where supported.
+- Treat image, audio, and video generation, embeddings, reranking, and batch inference as separate capability-gated adapters; never imply that selecting any text model makes every inference type available.
+- Record requested and effective settings. Unsupported settings must fail visibly rather than disappear.
+- Make sessions, runs, workspaces, artifacts, model attempts, fallback reasons, tools, commands, diffs, checkpoints, tokens, cost, latency, permissions, and provenance traceable and exportable through the same API in GUI and CLI.
+- Borrow the best proven behaviors from VS Code, Zed, Warp, Claude, OpenCode, Cursor, Devin, Windsurf, Google Antigravity, Arena, Conductor, T3 Code, and Agent Deck. The scorecard and acceptance tests are in `ALL_IN_ONE_AGENT_WORKSPACE_PLAN.md`.
+- Google Antigravity is a future reference/adapter, not the current Gemini CLI backend.
+
+### OpenCode test-session privacy — highest priority
+
+- Internal OpenCode probe/test sessions must be hidden from every normal UI and API path forever while retaining root-only audit evidence.
+- This is a server-side authorization/visibility invariant, not a CSS filter and not deletion.
+- Future producers use the exact reserved marker `__mimule_probe_v1__:`. Ordinary clients cannot request the internal classification.
+- The verified legacy ids require a one-time immutable migration receipt; never keep a broad title/root-directory heuristic that could hide a legitimate session.
+- Exclude hidden sessions before serialization from lists, direct-id descendants, messages, diffs, mutations, search, recents, counts, restored state, notifications, analytics, imports, and filtered SSE.
+- A root-only audited CLI may include them only with an explicit diagnostic flag.
+- Do not claim this is complete while the raw OpenCode upstream remains publicly reachable.
+
+## Verified state to recheck
+
+- Credential observation shipped in `/opt/mimoun@84770ba`; its Control Surface reader/UI shipped in `/opt/opencode-control-surface@56934b0`.
+- Validation receipt schema v3 shipped in Control Surface `a4b0046`.
+- The AIHubMix credential is installed by name in `/etc/litellm/litellm.env`, which was verified `0600 root:root`. Never display its value.
+- The observed AIHubMix catalog had zero-price candidates, but the supplied account returned a canned zero-usage quota/balance response. Therefore zero AIHubMix models were durably verified usable and none should be added from catalog evidence alone.
+- Catalog/discovery/redemption shipped in `/opt/mimoun@4007b3f` and was pushed to `origin/main`. It is observation-only on full scans: it writes catalog/health/proposal evidence but cannot edit LiteLLM configuration, hot-add a route, or restart LiteLLM. Recheck the first scheduled-run evidence in the newest repair-plan and Vault append before acting on a proposal.
+- `OMNIROUTE_INTEGRATION_PLAN.md` is research and design only. No OmniRoute service, container, provider key, route, or public endpoint has been authorized or created.
+- `ALL_IN_ONE_AGENT_WORKSPACE_PLAN.md` is a Shape design brief awaiting explicit operator confirmation.
+- A verified raw OpenCode upstream bypass remains reachable outside the authenticated Control Surface, and its service configuration exposes credentials too broadly. Exact endpoint, listener, and unit evidence is retained only in the private AI Vault. This prevents an honest “hidden forever” claim.
+- At the 2026-07-18 observation, OpenCode history contained about 100 root-directory sessions, overwhelmingly probe/test noise. Future marker changes do not retroactively secure or hide them.
+- Root and runtime READMEs now explain current behavior and roadmap behavior in plain language; verify their committed hashes before editing.
+
+## Next execution order
+
+1. Reconcile the newest commits, pushes, plan/Vault evidence, timers, service state, and dirty-tree ownership. Do not assume this prompt’s snapshot is newer than the append-only logs.
+2. Observe the next scheduled model-health cycles. Inspect only sanitized catalog counts, diff hashes, credential categories, candidate/admission decisions, config diffs, and service identity. Never print provider bodies or key values.
+3. If no AIHubMix model returned a substantive completion, leave its live rotation empty and report the truthful reason. If a model passes every SPEC 49 gate, admit only that exact route and prove the config/hot-add result without bypassing restart gates.
+4. Ask the operator to confirm the recommended defaults in the Agent Workspace Shape brief.
+5. Separately request one-shot authorization for Slice 0 production containment: loopback/Unix binding, raw Caddy/DNS route removal, firewall verification, secrets-file migration, and rotation of credentials exposed inline.
+6. After that authorization, write a bounded Slice 0 spec; have GPT Terra or Sonnet 5 implement it; run Fable's objective gates and at most one risk-based adversarial pass; capture external and loopback acceptance evidence. Do not combine it with UI work.
+7. Only after Slice 0 passes, implement Slice 1: durable ownership-aware registry plus immutable hidden-session enforcement across every path and SSE.
+8. Then implement Slice 2 multi-session terminals, Slice 3 unified read shell, Slice 4 complete launch/model controls, Slice 5 traces/artifacts/CLI, and Slice 6 workspace/profile hardening. Each slice must preserve legacy behavior until its parity gate passes.
+9. OmniRoute Phase 1 remains a separate explicit decision. Do not let Agent Workspace approval imply aggregator deployment or external sharing.
+10. Keep the routing repair arc shadow-only until its existing restart, causal receipt, exact-429, recovery/canary, R4/R5, and authorized real-work gates all pass. Do not infer enforcement permission.
+
+## Safety boundaries
+
+- Never touch `/opt/newsbites`.
+- Do not run Playwright or a browser on this VPS. Use an allowed external/staging visual-verification path when a UI slice needs it.
+- Never broad-kill processes, rewrite branch history, force-push, reset a dirty tree, or discard another agent’s work.
+- Resolve exact process and file targets before operational changes.
+- Never hand-edit fallback chains owned by reprobe.
+- Do not manually restart LiteLLM or run a competing reprobe while repair-arc timing evidence is aging unless a separately authorized recovery requires it.
+- Do not enable R2 enforcement, public OmniRoute sharing, or raw OpenCode production containment by implication.
+- Never echo credentials, read them into chat, put them on command lines, or commit environment files.
+- Keep docs factual: label research, proposal, implemented code, deployed runtime, and accepted behavior as different states.
+
+## Required evidence and publication protocol
+
+For every slice:
+
+1. record scope and acceptance conditions in the relevant spec;
+2. implement in an isolated worktree with GPT Terra or Sonnet 5;
+3. run focused executable tests, syntax/type/build checks, and diff checks; add at most one independent adversarial pass only when risk or the specification requires it, and never loop reviews indefinitely;
+4. inspect live/config effects in proportion to risk;
+5. secret-scan the staged diff without printing candidate values;
+6. commit only owned paths with an imperative subject;
+7. push the correct branch to its verified GitHub remote when authorized;
+8. append a UTC entry to the most specific plan;
+9. append the same factual status to both `/root/MIMULE_MASTER_PLAN_V3.md` and `/home/agent/MIMULE_MASTER_PLAN_V3.md`;
+10. append the session to `/opt/ai-vault/daily/<UTC-date>.md`;
+11. update the relevant README and docs when behavior, architecture, commands, or operator expectations change; keep goals, components, control/data flow, routing/health logic, current-versus-roadmap status, commands, security boundaries, and the documentation map in plain language;
+12. report commit hashes, pushed branches, tests, live evidence, remaining gates, and any credential-rotation recommendation.
+
+Completion means every operator requirement above is either shipped with evidence or explicitly recorded as still gated. Never turn a plan, a hidden UI row, an HTTP 200, or a passing self-test into a false completion claim.

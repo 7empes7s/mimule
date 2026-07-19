@@ -2377,3 +2377,42 @@ NEXT:
 - Use the fresh Builder preview links while the quick tunnels remain alive; relaunch from Builder if Cloudflare quick tunnel returns 1033 again.
 - Decide whether to commit the current Control Surface working tree, which contains both this fix and pre-existing uncommitted builder/security changes from the Claude session.
 - Clean or ignore generated GaffrPro artifacts (`BUILDER_DIR/`, `PASS_RESULT.json`, `*.tsbuildinfo`, `certs/`) before any future GaffrPro commit.
+
+### 2026-07-18 21:21 UTC - Codex
+STATUS:
+- Shipped observation-only provider credential health and deployed its Control Surface read path; the scheduled routing shadow completed a third agreeing operational cycle with no config change or restart. OmniRoute remains a source-audited plan only.
+
+CHANGES:
+- `/opt/mimoun@84770ba`: credential probes + status-only root-owned evidence on full model checks.
+- `/opt/opencode-control-surface@56934b0`: strict credential reader/API annotation/responsive UI; restarted only `control-surface.service`.
+- Updated SPEC 48, the routing repair plan, OmniRoute plan, canonical `/home/agent/MIMULE_MASTER_PLAN_V3.md`, and the AI Vault daily log.
+
+EVIDENCE:
+- Tests: probe 15/15, reprobe 23/23, Control Surface 50/50 / 220 expectations; build/check green; two reviews found no P0/P1.
+- Live: OpenCode Go credential valid, Minimax M3 live, Mimo Pro slow; GitHub and OpenCode Zen rate-limited rather than proven expired. Ten safe credential rows served by build `56934b0`.
+- Natural 21:20 reprobe: pool=39, same shadow-only 0/46 proposal, unchanged routing hashes and LiteLLM PID; no enforcement.
+
+NEXT:
+- Design the causal timer receipt wrapper; let R1 gates age; keep R2 shadow-only.
+- Authorize OmniRoute Phase 1 separately before any deployment or secret creation.
+
+### 2026-07-19 07:44 UTC - Codex
+
+STATUS:
+- Shipped and pushed complete provider-catalog discovery, exact-identity activation evidence, credential-aware bounded redemption, and transactional fallback-config receipts in `/opt/mimoun@4007b3f`. No model was activated and no service was restarted.
+
+CHANGES:
+- Added `scripts/model-discovery.mjs`; integrated full-only discovery into model health; hardened credential refresh, substantive-response admission, exact provider/model/backend binding, catalog drift and legacy provenance, and OpenCode probe titles.
+- Kept discovery observation-only. The Python reprobe remains the sole fallback writer and now validates both candidate configs, preserves metadata during atomic replacement, detects operator races, rolls back partial pair writes, and records bounded success/failure receipts.
+- Expanded the root README, SPEC 49, routing repair plan, OmniRoute plan, unified Agent Workspace design, and Claude Fable handover. Control Surface documentation was already pushed at `cec34d9`.
+
+EVIDENCE:
+- Final one-time gate: Node 50/50; Python 50/50; JavaScript/Python syntax; tracked and untracked whitespace; exact frozen diff `acaeaabae5c1e6d8f793bf0ebdaf027234e49952fc3c73cfa2c44049a946624b`; no high-confidence secret; no bytecode/temp artifact.
+- The full 13-commit publication range was scanned and pushed. Local and GitHub `main` both resolve to `4007b3f12046d086fd2568b891a8634633a38341`.
+- LiteLLM remained PID `2137446`, active since 2026-07-18 14:03:13 UTC. Routing-config hashes stayed at `0c9f7764...e093` and `922a5914...a79` through merge; no manual scan, config apply, hot-add, or restart occurred.
+- AIHubMix/inferera remains one provider identity. The observed account returned canned zero-token quota/balance responses, so zero AIHubMix free models were durably accepted and none entered the rotation. Arena, Mammouth, Lookatmy.ai, and OmniRoute remain research/plan-only.
+
+NEXT:
+- Let the existing 08:05 UTC full-health timer create the first live catalog artifact; inspect only sanitized counts, credential categories, proposals, config hashes, and service identity. Do not activate a proposal without the separate apply path.
+- Rotate the AIHubMix credential because it was pasted into chat.
+- Obtain explicit operator confirmation of the Agent Workspace Shape defaults and separate one-shot authorization for raw OpenCode Slice 0 containment before claiming internal test sessions are permanently hidden.
