@@ -24,6 +24,7 @@ When compacting this conversation, always preserve:
 | Service | Type | Path | Port | Public URL |
 |---|---|---|---|---|
 | NewsBites | systemd (`newsbites.service`) | `/opt/newsbites/` | 3001 | news.techinsiderbytes.com |
+| Know | systemd (`know-web.service`) | `/opt/know/web/` | 3400 | know.techinsiderbytes.com |
 | TIB Markets | systemd (`tib-markets.service`) | `/opt/tib-markets/` | 3500 | finance.techinsiderbytes.com |
 | Paperclip | Docker (`paperclip`) | `/opt/paperclip/` | 3100 | paperclip.techinsiderbytes.com |
 | OpenClaw/Mimule | Docker (`openclaw_gateway`) | `/opt/mimoun/` | 18789 | mimoun.techinsiderbytes.com |
@@ -109,6 +110,17 @@ title, slug, date, vertical, tags, status, lead, digest, coverImage, author
 `digest` = short-form for `/app` reader. `lead` = card/hero excerpt. Never conflate.
 
 **Do not set `status: published` manually** — use `npm run publish:dossier` or the autopipeline.
+
+---
+
+## Know (`/opt/know/web/`)
+
+Next.js learning-story application with product-local health, operations, doctor, and draft-first
+dossier contracts. Read `/opt/know/web/AGENTS.md`, `docs/KNOW_OPERATIONS.md`, and
+`ops/control-surface.json` before changing it. Use only the shared LiteLLM logical names and keep
+Know state separate from NewsBites. Health, ops, and doctor artifacts live at
+`/var/lib/mimule/know-{health,ops,doctor}.json`; art generation and publication remain explicitly
+operator-gated.
 
 ---
 

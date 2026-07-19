@@ -2449,3 +2449,35 @@ EVIDENCE:
 NEXT:
 - Operator: rotate the previously-exposed provider credentials (some are shared with LiteLLM - coordinate that restart with the repair-arc gate) and, when next in the Cloudflare dashboard, remove the now-404 public hostname and its DNS record.
 - Do NOT claim internal test sessions are permanently hidden yet: that requires Slice 1 (durable ownership-aware registry + server-side visibility invariant), the next build slice, delegated to Codex Terra/Luna or Sonnet 5.
+
+### 2026-07-19 12:35 UTC - Codex
+
+STATUS:
+- Supersedes the prior Slice 1 warning: Agent Workspace Slice 1 is now implemented, deployed, and accepted. The exact legacy internal set is durably hidden from normal list/direct/count/event paths and available only through the explicit audited root diagnostic.
+- Know's professional email catalog, default-off story-email preference, and first-class Control Surface surface are live.
+
+EVIDENCE:
+- Control Surface: 1,340 tests pass, `bun run check` passes, live schema v12, 2,490 immutable internal receipts, 77 governed OpenCode sessions plus 4 Codex sessions, request-scoped home/discovery counts, 401 anonymous registry, 404 hidden/unknown direct routes, `0600` state, and loopback-only raw OpenCode.
+- Know: check/typecheck/build pass; local and edge health 200; DB schema v4; 8 live stories. The 13-scenario HTML/text template system and signed-in, opted-in, live-story-only delivery path are deployed; no unsolicited message was sent.
+
+NEXT:
+- Agent Workspace Slice 2 is next. Know logical-model availability remains the only doctor warning. Rotate the chat-exposed Microsoft 365 application secret in Entra and install the replacement on-box only.
+
+### 2026-07-19 13:30 UTC - Claude (Opus 4.8)
+
+STATUS:
+- Shipped the Know ↔ Control Surface "Email & delivery" slice: a first-class, sanitized Email & delivery surface on `/know`. Verified end-to-end. Not committed or pushed (worktree changes preserved per instruction).
+
+CHANGES:
+- Know (low-risk; no live app-code, no Next rebuild/restart): `scripts/know-ops.mjs` now emits a sanitized `email` block in `/var/lib/mimule/know-ops.json` — transport/readiness derived from env *presence* only (mirrors `lib/mailer.ts isMailConfigured`), 13-scenario template coverage (rendered with placeholders; only booleans/names stored), `optedIn` aggregate, `liveEligible`, and a forward-compatible `deliveryLog` outcome shape (currently `absent`). Regenerated the live artifact via `systemctl start know-ops.service`.
+- Control Surface: `server/api/types.ts` (`KnowDetail.email`), `server/api/know.ts` (strict field-whitelisted population — drops any unexpected passthrough), `app/routes/KnowPage.tsx`+`KnowPage.css` (new "Email & delivery" section, responsive, honest empty/degraded states), tests in `server/api/know.test.ts` (shaping + privacy-passthrough + no-email-block degradation).
+- Docs: rewrote `/opt/know/web/docs/CONTROL_SURFACE_HANDOFF.md` from the old pending request to the implemented state, with delivery-outcome instrumentation named as the next slice.
+
+EVIDENCE:
+- Know: `npm run check` and `npm run typecheck` pass. Live artifact email block = `configured:true / microsoft365-oauth / ready`, templates 13/13 HTML+text complete, `optedIn:1`, `liveEligible:8`, `deliveryLog:absent`. Full-artifact leak scan: NONE (no addresses, tokens, secrets).
+- Control Surface: `bun run typecheck` clean; full suite **1342 pass / 0 fail** (167 files, 10,308 assertions); `bun run check` (typecheck + vite build) passes. Isolated ephemeral server (throwaway token, isolated DB): anonymous `/api/know` 401, authenticated 200 with email block, leak scan NONE. After restarting only `control-surface.service`: home 200, fresh `/api/version`, anonymous `/api/know` 401, live authenticated `/api/know` 200 with the email block, leak scan NONE, journal clean. `git diff --check` on the slice's files: clean (repo-wide warnings are all pre-existing in unrelated files).
+
+NEXT:
+- Delivery-outcome instrumentation (makes `deliveryLog:"present"` real): append-only PII-free `email_deliveries(scenario,status,created_at)` table (Know migration v4→v5) + fail-safe recording in `app/api/stories/email/route.ts`; needs a Know rebuild + `know-web.service` restart. The ops block and CS UI already consume it.
+- Optional governed "render previews" action (`run:know:email-previews`, renders 13 previews, never sends) + an email-config doctor check.
+- Standing (operator-gated, untouched): rotate the chat-exposed Microsoft 365 application secret in Entra; raw OpenCode remains loopback-only.

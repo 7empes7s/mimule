@@ -2956,3 +2956,25 @@ Validation:
 Next:
 
 - Continue ULTRAPLAN Phase 3 A4 with `Chain preview + apply`.
+
+### 2026-07-10 07:50 UTC - Codex
+
+Completed the scheduler-plan handoff into `/root/control-surface-plans/ULTRAPLAN.md` Phase 3 A4 `Gateway key rotate`.
+
+Status:
+
+- Scheduler-plan checkboxes remain unchanged because this scheduler plan still has no unchecked `[ ]` implementation items.
+- Marked the corresponding ULTRAPLAN item complete.
+- Added schema/service/API/executor/catalog support for `rotate:gateway-key:<id>` with grace-period dual-validity.
+
+Evidence:
+
+- `bun test server/gateway/keys.test.ts` 19/0.
+- `bun test server/api/execute.test.ts` 17/0.
+- `bun test server/api/actionDescriptors.test.ts` 5/0.
+- `bun run typecheck`, `bun run build`, `bun run check`, and `git diff --check` passed.
+- Isolated temp server on `:3299`: `/health` OK and `/api/actions/catalog` reported `gatewayKeys: ok`.
+
+Next:
+
+- Continue ULTRAPLAN Phase 3 A4 with `Route override with TTL`.
