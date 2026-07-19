@@ -21,6 +21,7 @@ export const CREDENTIAL_HEALTH_SCHEMA_VERSION = 1;
 export const CREDENTIAL_HEALTH_POLICY_VERSION = "credential-observation-v1";
 export const CREDENTIAL_HEALTH_TTL_MS = 13 * 60 * 60 * 1000;
 export const MAX_RESPONSE_BYTES = 4096;
+const MAX_MODEL_LIST_PROBE_BYTES = 256 * 1024;
 export const MAX_ARTIFACT_BYTES = 256 * 1024;
 export const MAX_MODELS_PER_CREDENTIAL = 256;
 export const DEFAULT_CREDENTIAL_PROBE_LOCK = "/run/model-credential-health.lock";
@@ -38,6 +39,7 @@ export const CREDENTIAL_STATUSES = Object.freeze([
 ]);
 
 export const ALLOWED_CREDENTIAL_ENV_NAMES = Object.freeze([
+  "AIHUBMIX_API_KEY",
   "CEREBRAS_API_KEY",
   "CEREBRAS_API_KEY_PAID",
   "CLOUDFLARE_API_TOKEN",
@@ -52,7 +54,7 @@ export const ALLOWED_CREDENTIAL_ENV_NAMES = Object.freeze([
 
 const ALLOWED_CREDENTIALS = new Set(ALLOWED_CREDENTIAL_ENV_NAMES);
 const MODEL_NAME_RE = /^\s*-\s*model_name:\s*(?:"([^"]+)"|'([^']+)'|([^\s#]+))/;
-const API_KEY_ENV_RE = /\bapi_key:\s*os\.environ\/([A-Z][A-Z0-9_]*)\b/;
+const API_KEY_ENV_RE = /\bapi_key:\s*(?:"os\.environ\/([A-Z][A-Z0-9_]*)"|'os\.environ\/([A-Z][A-Z0-9_]*)'|os\.environ\/([A-Z][A-Z0-9_]*))(?:\s+#.*)?\s*$/;
 const SAFE_MODEL_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,199}$/;
 const SAFE_ENV_NAME_RE = /^[A-Z][A-Z0-9_]{0,63}$/;
 
@@ -76,9 +78,9 @@ function completionRequest(url, secret, model) {
   };
 }
 
-function parseBoundedJson(bodyText) {
+function parseBoundedJson(bodyText, limit = MAX_RESPONSE_BYTES) {
   try {
-    const parsed = JSON.parse(String(bodyText || "").slice(0, MAX_RESPONSE_BYTES));
+    const parsed = JSON.parse(String(bodyText || "").slice(0, limit));
     return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
   } catch {
     return null;
@@ -90,8 +92,8 @@ function completionSuccess(bodyText) {
   return Array.isArray(parsed?.choices);
 }
 
-function dataListSuccess(bodyText) {
-  const parsed = parseBoundedJson(bodyText);
+function dataListSuccess(bodyText, limit = MAX_RESPONSE_BYTES) {
+  const parsed = parseBoundedJson(bodyText, limit);
   return Array.isArray(parsed?.data);
 }
 
@@ -101,12 +103,13 @@ function modelObjectSuccess(bodyText) {
 }
 
 const PINNED_PROBE_ORIGINS = new Set([
+  "https://aihubmix.com",
   "https://api.cerebras.ai",
   "https://api.cloudflare.com",
   "https://api.groq.com",
   "https://generativelanguage.googleapis.com",
   "https://integrate.api.nvidia.com",
-  "https://models.inference.ai.azure.com",
+  "https://models.github.ai",
   "https://opencode.ai",
   "https://openrouter.ai",
 ]);
@@ -119,6 +122,15 @@ function assertPinnedProbeUrl(rawUrl) {
 }
 
 const ADAPTERS = Object.freeze({
+  AIHUBMIX_API_KEY: {
+    provider: "aihubmix",
+    maxResponseBytes: MAX_MODEL_LIST_PROBE_BYTES,
+    request: ({ secret }) => ({
+      url: "https://aihubmix.com/v1/models",
+      options: { headers: bearerHeaders(secret) },
+    }),
+    success: bodyText => dataListSuccess(bodyText, MAX_MODEL_LIST_PROBE_BYTES),
+  },
   CEREBRAS_API_KEY: {
     provider: "cerebras",
     request: ({ secret }) => ({ url: "https://api.cerebras.ai/v1/models", options: { headers: bearerHeaders(secret) } }),
@@ -155,9 +167,9 @@ const ADAPTERS = Object.freeze({
   GITHUB_TOKEN: {
     provider: "github-models",
     request: ({ secret }) => completionRequest(
-      "https://models.inference.ai.azure.com/chat/completions",
+      "https://models.github.ai/inference/chat/completions",
       secret,
-      "gpt-4.1",
+      "openai/gpt-4.1",
     ),
     success: completionSuccess,
   },
@@ -223,8 +235,8 @@ export function parseCredentialModelMap(configText) {
     }
     if (!currentModel) continue;
     const keyMatch = line.match(API_KEY_ENV_RE);
-    if (!keyMatch || !ALLOWED_CREDENTIALS.has(keyMatch[1])) continue;
-    const envName = keyMatch[1];
+    const envName = keyMatch ? (keyMatch[1] || keyMatch[2] || keyMatch[3]) : null;
+    if (!envName || !ALLOWED_CREDENTIALS.has(envName)) continue;
     if (!mapped.has(envName)) mapped.set(envName, new Set());
     mapped.get(envName).add(currentModel);
   }
@@ -234,6 +246,25 @@ export function parseCredentialModelMap(configText) {
       .sort(([a], [b]) => a.localeCompare(b))
       .map(([envName, names]) => [envName, [...names].sort()]),
   );
+}
+
+export function credentialNamesRequiringObservation(configText, env = {}) {
+  const mapping = parseCredentialModelMap(configText);
+  // Discovery credentials need an observation before their first model is
+  // registered. Keep this exception explicit rather than probing every unused
+  // personal credential loaded in the environment.
+  if (typeof env.AIHUBMIX_API_KEY === "string" && env.AIHUBMIX_API_KEY.trim() && !mapping.AIHUBMIX_API_KEY) {
+    mapping.AIHUBMIX_API_KEY = [];
+  }
+  return { mapping, envNames: Object.keys(mapping).filter(name => ALLOWED_CREDENTIALS.has(name)).sort() };
+}
+
+export function credentialHealthCoversRelevantKeys(previous, configText, env = {}) {
+  const { envNames } = credentialNamesRequiringObservation(configText, env);
+  return envNames.every(envName => {
+    const row = previous?.credentials?.[envName];
+    return row && typeof row === "object" && Number.isFinite(row.checkedAt);
+  });
 }
 
 function explicitBodyStatus(bodyText) {
@@ -427,7 +458,7 @@ export async function probeCredentialHealth({
   if (typeof fetchImpl !== "function") throw new TypeError("fetchImpl must be a function");
   if (!Number.isFinite(now) || now <= 0) throw new TypeError("now must be a positive timestamp");
 
-  const mapping = parseCredentialModelMap(configText);
+  const { mapping } = credentialNamesRequiringObservation(configText, env);
   const credentials = {};
 
   for (const envName of Object.keys(mapping).sort()) {
@@ -453,7 +484,7 @@ export async function probeCredentialHealth({
             signal: controller.signal,
           });
           httpCode = safeHttpCode(response?.status);
-          const bodyText = await boundedResponseText(response);
+          const bodyText = await boundedResponseText(response, adapter.maxResponseBytes || MAX_RESPONSE_BYTES);
           status = classifyCredentialResponse(httpCode, bodyText, adapter.success(bodyText));
         } catch {
           status = "unknown";

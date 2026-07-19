@@ -20,7 +20,7 @@
  */
 
 import fs from "node:fs";
-import { execSync, spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { recalculateAllStatuses } from "/opt/mimoun/scripts/model-quality-writer.mjs";
 import {
   ALLOWED_CREDENTIAL_ENV_NAMES,
@@ -29,6 +29,29 @@ import {
   readCredentialHealthPrevious,
   writeCredentialHealthAtomic,
 } from "./credential-health.mjs";
+import {
+  MODEL_CATALOG_FILE,
+  acquireModelHealthRunLock,
+  annotateCandidatesWithCredentialHealth,
+  assertSafeProviderModelId,
+  buildActivationEvidence,
+  candidateIdentity,
+  classifyAiHubMixCompletion,
+  collectModelCatalog,
+  dedupeAndNameCandidates,
+  dynamicProviderAdmissionPolicy,
+  hasExplicitBillingApproval,
+  isExplicitCatalogDynamic,
+  lookupModelEntry,
+  mergeCatalogCandidates,
+  normalizeProbeFailure,
+  parseConfiguredModelBindings,
+  planModelProbeQueue,
+  readModelCatalogPrevious,
+  isExactPingResponse,
+  writeModelCatalogAtomic,
+  writeRootJsonAtomic,
+} from "./model-discovery.mjs";
 
 const HEALTH_FILE         = "/var/lib/mimule/model-health.json";
 const CREDENTIAL_HEALTH_FILE = "/var/lib/mimule/credential-health.json";
@@ -39,9 +62,16 @@ const LITELLM_ENV  = "/etc/litellm/litellm.env";
 const AUTOPIPE_ENV = "/etc/default/newsbites-autopipeline";
 const LITELLM_CFG  = "/etc/litellm/config.yaml";
 
+const REDEMPTION_PER_PROVIDER = 3;
+const REDEMPTION_GLOBAL = 18;
+const NEW_PROBE_PER_PROVIDER = 8;
+const NEW_PROBE_GLOBAL = 48;
+
 const PING_PROMPT   = 'Reply with exactly this JSON object on one line, nothing else: {"status":"ok"}';
 const PING_TIMEOUT  = 20_000;
 const PING_MAX_TOKENS = 40;
+const PING_MAX_RESPONSE_BYTES = 256 * 1024;
+const ACTIVATION_INFO_MAX_BYTES = 2 * 1024 * 1024;
 const GOOD_LATENCY  = 15_000;
 const QUALITY_REQUIRED_CAPABILITIES = new Set(["heavy", "medium"]);
 const PAID_LAST_RESORT_MODELS = new Set([
@@ -70,27 +100,56 @@ function extractAssistantContent(body) {
   }
 }
 
-function isParseableJsonResponse(content) {
-  if (!content || typeof content !== "string") return false;
-  const text = content.trim();
-  if (!text) return false;
-  // Try direct parse first; if that fails, try to extract a JSON object from
-  // surrounding text (some models still wrap in markdown despite instructions).
+async function readBoundedCompletionBody(response, maxBytes = PING_MAX_RESPONSE_BYTES) {
+  const declared = Number.parseInt(response?.headers?.get?.("content-length") || "", 10);
+  if (Number.isFinite(declared) && declared > maxBytes) throw new Error("probe_body_bounds");
+  if (!response?.body || typeof response.body.getReader !== "function") throw new Error("probe_body_unreadable");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let bytes = 0;
+  let text = "";
   try {
-    const obj = JSON.parse(text);
-    return obj && typeof obj === "object";
-  } catch {
-    const match = text.match(/\{[\s\S]*\}/);
-    if (!match) return false;
-    try {
-      const obj = JSON.parse(match[0]);
-      return obj && typeof obj === "object";
-    } catch {
-      return false;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = value instanceof Uint8Array ? value : new Uint8Array(value || []);
+      bytes += chunk.byteLength;
+      if (bytes > maxBytes) throw new Error("probe_body_bounds");
+      text += decoder.decode(chunk, { stream: true });
     }
+    return text + decoder.decode();
+  } finally {
+    try { await reader.cancel(); } catch { /* already consumed/aborted */ }
   }
 }
-const MAX_NEW_OR    = 8;
+
+function successfulProbeResult(model, { latency, content, resolvedModel = null }) {
+  const probeContractOk = isExactPingResponse(content);
+  const contractRequired = model?.probeContractRequired === true;
+  return {
+    available: contractRequired ? probeContractOk : true,
+    transportAvailable: true,
+    latency,
+    ...(resolvedModel ? { resolvedModel } : {}),
+    jsonOk: probeContractOk,
+    probeContractOk,
+    probeSucceededThisRun: probeContractOk,
+    ...(contractRequired && !probeContractOk ? { error: "probe_contract_failed" } : {}),
+    sampleContent: String(content || "").slice(0, 80),
+  };
+}
+
+function failedProbeResult(latency, error, extra = {}) {
+  return {
+    available: false,
+    transportAvailable: false,
+    latency,
+    error,
+    probeContractOk: false,
+    probeSucceededThisRun: false,
+    ...extra,
+  };
+}
 const FULL_STALE_MS = 7 * 3600 * 1000;
 const QUICK_COLLAPSE_MIN_PREV = 3;
 const QUICK_COLLAPSE_MAX_CURR = 1;
@@ -143,7 +202,13 @@ const WORKLOAD_TASKS = {
 // timeout, so the opencode process (and any children) can never orphan to init.
 function runOpencodeProbe(modelId, prompt, key, timeoutMs) {
   return new Promise((resolve) => {
-    const args = ["run", "--dangerously-skip-permissions"];
+    const titleId = slugify(modelId || "default", 48) || "default";
+    const args = [
+      "run",
+      "--dangerously-skip-permissions",
+      "--title",
+      `__mimule_probe_v1__:model-health:workload:${titleId}`,
+    ];
     if (modelId) args.push("--model", modelId);
     args.push("-");
     const child = spawn("/root/.opencode/bin/opencode", args, {
@@ -200,19 +265,22 @@ async function runWorkloadProbe(model, taskKey) {
         fallbacks: [],
       }),
     });
-    clearTimeout(timer);
-    if (!res.ok) return { score: 0, latencyMs: Date.now() - start, error: `HTTP ${res.status}` };
-    const content = extractAssistantContent(await res.text().catch(() => ""));
+    if (!res.ok) {
+      try { await res.body?.cancel?.(); } catch { /* complete */ }
+      return { score: 0, latencyMs: Date.now() - start, error: `HTTP ${res.status}` };
+    }
+    const content = extractAssistantContent(await readBoundedCompletionBody(res));
     return { score: task.score(content), latencyMs: Date.now() - start };
   } catch (e) {
+    return { score: 0, latencyMs: Date.now() - start, error: e.name === "AbortError" ? "timeout" : "probe_error" };
+  } finally {
     clearTimeout(timer);
-    return { score: 0, latencyMs: Date.now() - start, error: e.name === "AbortError" ? "timeout" : e.message };
   }
 }
 
 // Run workload probes for a batch of results; merge into quality file.
 // Returns a Map<logicalName, workloadScores>.
-async function runWorkloadProbesForResults(results, quality) {
+async function runWorkloadProbesForResults(results, quality, policy) {
   const now = Date.now();
   const shouldProbe = r => {
     const q = quality?.models?.[r.logicalName];
@@ -222,10 +290,17 @@ async function runWorkloadProbesForResults(results, quality) {
 
   const lastProbedOf = (r) => quality?.models?.[r.logicalName]?.workloadScores?.lastProbedAt ?? 0;
   // Always probe available local models (GPU health is critical and cheap via LiteLLM).
-  const localAvail = results.filter(r => r.available && r.provider === "local" && shouldProbe(r));
+  const substantivelyAvailable = r => r.available === true
+    && (r.probeContractRequired !== true || r.probeContractOk === true)
+    && r.activationPending !== true
+    && r.credentialBlocked !== true
+    && (r.dynamicProvenance !== "catalog-auto-v1" || r.catalogEligibility === "eligible")
+    && (r.autoPromotionPolicy !== "manual-approval-required"
+      || hasExplicitBillingApproval(lookupModelEntry(policy?.models, r)));
+  const localAvail = results.filter(r => substantivelyAvailable(r) && r.provider === "local" && shouldProbe(r));
   // Rotate cloud models oldest-first (never-probed = 0 sorts first), capping queue depth and CLI probes.
   const cloudPool = results
-    .filter(r => r.available && r.provider !== "local" && shouldProbe(r))
+    .filter(r => substantivelyAvailable(r) && r.provider !== "local" && shouldProbe(r))
     .sort((a, b) => lastProbedOf(a) - lastProbedOf(b));
   const cloudQueued = [];
   let cliUsed = 0;
@@ -238,7 +313,7 @@ async function runWorkloadProbesForResults(results, quality) {
     cloudQueued.push(m);
   }
   const toProbe = [...localAvail, ...cloudQueued];
-  const unavailable = results.filter(r => !r.available && shouldProbe(r));
+  const unavailable = results.filter(r => r.available === false && shouldProbe(r));
 
   if (toProbe.length === 0 && unavailable.length === 0) return new Map();
 
@@ -428,8 +503,7 @@ function readJsonFile(filePath, fallback) {
 }
 
 function writeJsonFile(filePath, data) {
-  fs.mkdirSync("/var/lib/mimule", { recursive: true });
-  fs.writeFileSync(filePath, `${JSON.stringify(data, null, 2)}\n`, "utf8");
+  writeRootJsonAtomic(filePath, data);
 }
 
 const env = { ...loadEnvFile(LITELLM_ENV), ...loadEnvFile(AUTOPIPE_ENV) };
@@ -438,24 +512,14 @@ async function refreshCredentialHealth(now) {
   const probeLock = acquireCredentialProbeLock();
   if (!probeLock.acquired) {
     console.log("Credential health: another refresh is active");
-    return;
+    return null;
   }
 
   try {
     const previous = readCredentialHealthPrevious(CREDENTIAL_HEALTH_FILE);
-    const minRefreshMs = 5 * 60 * 60 * 1000;
-    if (
-      previous
-      && Number.isFinite(previous.generatedAt)
-      && previous.generatedAt <= now
-      && now - previous.generatedAt < minRefreshMs
-    ) {
-      console.log("Credential health: recent observation retained");
-      return;
-    }
-
+    const configText = fs.readFileSync(LITELLM_CFG, "utf8");
     const document = await probeCredentialHealth({
-      configText: fs.readFileSync(LITELLM_CFG, "utf8"),
+      configText,
       env,
       previous,
       now,
@@ -475,17 +539,14 @@ async function refreshCredentialHealth(now) {
       .map(([status, count]) => `${status}=${count}`)
       .join(", ");
     console.log(`Credential health: ${Object.keys(document.credentials).length} checked${summary ? ` (${summary})` : ""}`);
+    return document;
   } finally {
     probeLock.release();
   }
 }
 
 const LITELLM_KEY    = env.LITELLM_MASTER_KEY;
-const OPENROUTER_KEY = env.OPENROUTER_API_KEY;
-const GITHUB_TOKEN   = env.GITHUB_TOKEN;
 const ZEN_KEY        = env.OPENCODE_ZEN_KEY;
-const GROQ_KEY       = env.GROQ_API_KEY;
-const CF_TOKEN       = env.CLOUDFLARE_API_TOKEN;
 const CF_ACCOUNT_ID  = env.CLOUDFLARE_ACCOUNT_ID;
 const CF_API_BASE    = CF_ACCOUNT_ID
   ? `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/v1`
@@ -497,20 +558,6 @@ if (!LITELLM_KEY) {
   console.error("LITELLM_MASTER_KEY not found");
   process.exit(1);
 }
-
-// User-approved billing assumptions for automatic free discovery:
-// - OpenRouter: explicit pricing.prompt/completion === 0
-// - GitHub Models: treat chat-completion catalog as included-free/free-eligible
-//   only while paid usage is not opted in; demote to PAID_LAST_RESORT_MODELS if
-//   the account is configured to bill past the included free quota.
-// - Groq: treat catalog models as non-billed / free-eligible
-// - Zen / OpenCode: do not auto-promote new models unless a free signal exists
-const DISCOVERY_ASSUMPTIONS = {
-  githubAsFree: true,
-  groqAsFree: true,
-  zenRequiresExplicitFreeSignal: false,
-  cloudflareAsFree: true, // included with account; free tier has daily neuron quota
-};
 
 // Canonical pricing tiers. Returns one of:
 //   "free-local"        — runs on owned hardware (RTX 3090 via Vast.ai)
@@ -535,6 +582,13 @@ function pricingTierFor(model) {
   const modelId = String(model?.modelId || "");
   const apiKeyEnv = String(model?.apiKeyEnv || "");
 
+  // Auto-discovered routes use an explicit provider admission contract. Only
+  // AIHubMix/OpenRouter are verified zero-price; included-quota and
+  // subscription catalogs retain their distinct evidence labels.
+  if (model?.dynamicProvenance === "catalog-auto-v1") {
+    return dynamicProviderAdmissionPolicy(provider)?.pricingTier || "subscription";
+  }
+
   if (provider === "local") return "free-local";
 
   // OpenCode subscription pool (CLI-routed, included with OpenCode Pro)
@@ -543,7 +597,7 @@ function pricingTierFor(model) {
 
   // Cerebras: distinguish key path. The "-paid" logical name and
   // CEREBRAS_API_KEY_PAID env signal pay-as-you-go.
-  if (provider === "cerebras") {
+  if (provider === "cerebras" || provider === "cerebras-paid") {
     if (logicalName.endsWith("-paid") || apiKeyEnv === "CEREBRAS_API_KEY_PAID") return "api-paid";
     return "free-rate-limited";
   }
@@ -564,7 +618,7 @@ function pricingTierFor(model) {
   }
 
   // Groq, GitHub Models, Cloudflare, NVIDIA NIM — all have free quotas.
-  if (provider === "groq" || provider === "github" || provider === "cloudflare" || provider === "nvidia") {
+  if (["groq", "github", "cloudflare", "nvidia", "gemini", "aihubmix"].includes(provider)) {
     return "free-rate-limited";
   }
 
@@ -608,10 +662,10 @@ const MODEL_REGISTRY = [
   { logicalName: "openrouter-liquid-lfm-2-5-1-2b-instruct",   provider: "openrouter", testVia: "litellm", modelId: "liquid/lfm-2.5-1.2b-instruct:free",            capability: "light",  params: 1   },
 
   { logicalName: "github-gpt41",      provider: "github", testVia: "litellm", modelId: "gpt-4.1",                       capability: "heavy",  params: 200 },
-  { logicalName: "github-llama405b",  provider: "github", testVia: "direct",  modelId: "Meta-Llama-3.1-405B-Instruct", capability: "heavy",  params: 405, apiBase: "https://models.inference.ai.azure.com", apiKeyEnv: "GITHUB_TOKEN", litellmModel: "openai/Meta-Llama-3.1-405B-Instruct", litellmApiBase: "https://models.inference.ai.azure.com", litellmApiKeyEnv: "GITHUB_TOKEN" },
-  { logicalName: "github-gpt4o",      provider: "github", testVia: "direct",  modelId: "gpt-4o",                       capability: "heavy",  params: 200, apiBase: "https://models.inference.ai.azure.com", apiKeyEnv: "GITHUB_TOKEN", litellmModel: "openai/gpt-4o", litellmApiBase: "https://models.inference.ai.azure.com", litellmApiKeyEnv: "GITHUB_TOKEN" },
-  { logicalName: "github-gpt4o-mini", provider: "github", testVia: "direct",  modelId: "gpt-4o-mini",                  capability: "medium", params: 20,  apiBase: "https://models.inference.ai.azure.com", apiKeyEnv: "GITHUB_TOKEN", litellmModel: "openai/gpt-4o-mini", litellmApiBase: "https://models.inference.ai.azure.com", litellmApiKeyEnv: "GITHUB_TOKEN" },
-  { logicalName: "github-llama8b",    provider: "github", testVia: "direct",  modelId: "Meta-Llama-3.1-8B-Instruct",   capability: "light",  params: 8,   apiBase: "https://models.inference.ai.azure.com", apiKeyEnv: "GITHUB_TOKEN", litellmModel: "openai/Meta-Llama-3.1-8B-Instruct", litellmApiBase: "https://models.inference.ai.azure.com", litellmApiKeyEnv: "GITHUB_TOKEN" },
+  { logicalName: "github-llama405b",  provider: "github", testVia: "direct",  modelId: "Meta-Llama-3.1-405B-Instruct", capability: "heavy",  params: 405, apiBase: "https://models.github.ai/inference", apiKeyEnv: "GITHUB_TOKEN", litellmModel: "openai/Meta-Llama-3.1-405B-Instruct", litellmApiBase: "https://models.github.ai/inference", litellmApiKeyEnv: "GITHUB_TOKEN" },
+  { logicalName: "github-gpt4o",      provider: "github", testVia: "direct",  modelId: "gpt-4o",                       capability: "heavy",  params: 200, apiBase: "https://models.github.ai/inference", apiKeyEnv: "GITHUB_TOKEN", litellmModel: "openai/gpt-4o", litellmApiBase: "https://models.github.ai/inference", litellmApiKeyEnv: "GITHUB_TOKEN" },
+  { logicalName: "github-gpt4o-mini", provider: "github", testVia: "direct",  modelId: "gpt-4o-mini",                  capability: "medium", params: 20,  apiBase: "https://models.github.ai/inference", apiKeyEnv: "GITHUB_TOKEN", litellmModel: "openai/gpt-4o-mini", litellmApiBase: "https://models.github.ai/inference", litellmApiKeyEnv: "GITHUB_TOKEN" },
+  { logicalName: "github-llama8b",    provider: "github", testVia: "direct",  modelId: "Meta-Llama-3.1-8B-Instruct",   capability: "light",  params: 8,   apiBase: "https://models.github.ai/inference", apiKeyEnv: "GITHUB_TOKEN", litellmModel: "openai/Meta-Llama-3.1-8B-Instruct", litellmApiBase: "https://models.github.ai/inference", litellmApiKeyEnv: "GITHUB_TOKEN" },
 
   { logicalName: "zen-big-pickle",     provider: "zen", testVia: "direct", modelId: "big-pickle",       capability: "heavy", params: 100, apiBase: "https://opencode.ai/zen/v1", apiKeyEnv: "OPENCODE_ZEN_KEY", litellmModel: "openai/big-pickle", litellmApiBase: "https://opencode.ai/zen/v1", litellmApiKeyEnv: "OPENCODE_ZEN_KEY" },
   { logicalName: "zen-minimax",        provider: "zen", testVia: "direct", modelId: "minimax-m2.5",     capability: "heavy", params: 70,  apiBase: "https://opencode.ai/zen/v1", apiKeyEnv: "OPENCODE_ZEN_KEY", litellmModel: "openai/minimax-m2.5", litellmApiBase: "https://opencode.ai/zen/v1", litellmApiKeyEnv: "OPENCODE_ZEN_KEY" },
@@ -627,7 +681,7 @@ const MODEL_REGISTRY = [
   { logicalName: "cerebras-qwen3-235b-instruct", provider: "cerebras", testVia: "direct", modelId: "qwen-3-235b-a22b-instruct-2507", capability: "heavy", params: 235, apiBase: "https://api.cerebras.ai/v1", apiKeyEnv: "CEREBRAS_API_KEY",      litellmModel: "cerebras/qwen-3-235b-a22b-instruct-2507", litellmApiKeyEnv: "CEREBRAS_API_KEY"      },
   { logicalName: "cerebras-llama31-8b",          provider: "cerebras", testVia: "direct", modelId: "llama3.1-8b",                   capability: "light", params: 8,   apiBase: "https://api.cerebras.ai/v1", apiKeyEnv: "CEREBRAS_API_KEY",      litellmModel: "cerebras/llama3.1-8b",                    litellmApiKeyEnv: "CEREBRAS_API_KEY"      },
   // PAID — last resort in fallback chains + OpenCode direct access; never picked by chooseCloudModel
-  { logicalName: "cerebras-qwen3-235b-paid",     provider: "cerebras", testVia: "direct", modelId: "qwen-3-235b-a22b-instruct-2507", capability: "heavy", params: 235, apiBase: "https://api.cerebras.ai/v1", apiKeyEnv: "CEREBRAS_API_KEY_PAID", litellmModel: "cerebras/qwen-3-235b-a22b-instruct-2507", litellmApiKeyEnv: "CEREBRAS_API_KEY_PAID" },
+  { logicalName: "cerebras-qwen3-235b-paid",     provider: "cerebras-paid", testVia: "direct", modelId: "qwen-3-235b-a22b-instruct-2507", capability: "heavy", params: 235, apiBase: "https://api.cerebras.ai/v1", apiKeyEnv: "CEREBRAS_API_KEY_PAID", litellmModel: "cerebras/qwen-3-235b-a22b-instruct-2507", litellmApiKeyEnv: "CEREBRAS_API_KEY_PAID" },
 
   { logicalName: "nvidia-llama33-70b", provider: "nvidia", testVia: "direct", modelId: "meta/llama-3.3-70b-instruct",        capability: "heavy", params: 70, apiBase: "https://integrate.api.nvidia.com/v1", apiKeyEnv: "NVIDIA_NIM_API_KEY", litellmModel: "openai/meta/llama-3.3-70b-instruct",        litellmApiBase: "https://integrate.api.nvidia.com/v1", litellmApiKeyEnv: "NVIDIA_NIM_API_KEY" },
   { logicalName: "nvidia-qwen3-80b",   provider: "nvidia", testVia: "direct", modelId: "qwen/qwen3-next-80b-a3b-instruct", capability: "heavy", params: 80, apiBase: "https://integrate.api.nvidia.com/v1", apiKeyEnv: "NVIDIA_NIM_API_KEY", litellmModel: "openai/qwen/qwen3-next-80b-a3b-instruct", litellmApiBase: "https://integrate.api.nvidia.com/v1", litellmApiKeyEnv: "NVIDIA_NIM_API_KEY" },
@@ -647,7 +701,6 @@ const DISCOVERY_EXCLUDE = new Set([
   "anthropic/claude-opus-4.6-fast",
   "gpt-4.1",
 ]);
-
 const EDITORIAL_INCOMPATIBLE_PATTERN =
   /safeguard|prompt-guard|content-filter|content-moderation|guardrails|moderation|\bembed\b|embedding|rerank|whisper|\btts\b|vision-only|image-gen|dall-?e|stable-diffusion/i;
 
@@ -680,12 +733,27 @@ function guessCapability(modelId) {
   // Explicit heavy indicators (regardless of param count)
   const heavyIndicators = /max|plus|pro|large|opus|codex|heavy|120b|235b|405b|70b/;
   if (params >= 30 || heavyIndicators.test(id)) {
-    return { capability: "heavy", params: params || 70 };
+    return { capability: "heavy", params: params || null, capabilityEvidence: "catalog-id-heuristic" };
   }
   if (params >= 10) {
-    return { capability: "medium", params };
+    return { capability: "medium", params, capabilityEvidence: "catalog-id-heuristic" };
   }
-  return { capability: "light", params: params || 1 };
+  if (params > 0) return { capability: "light", params, capabilityEvidence: "catalog-id-heuristic" };
+  // Unknown is intentionally not promoted into a workload class merely because
+  // an upstream catalog omitted parameter/capability metadata.
+  return { capability: "unknown", params: null, capabilityEvidence: "catalog-metadata-unclassified" };
+}
+
+function withDynamicCatalogProvenance(candidate, provider, catalogModelId) {
+  const admission = dynamicProviderAdmissionPolicy(provider);
+  if (!admission) throw new TypeError(`unsupported dynamic provider: ${provider}`);
+  return {
+    ...candidate,
+    catalogModelId: candidate.catalogModelId || catalogModelId,
+    dynamicProvenance: "catalog-auto-v1",
+    ...admission,
+    probeContractRequired: true,
+  };
 }
 
 function findRegistryMatch(provider, modelId) {
@@ -705,10 +773,10 @@ function buildDiscoveredCandidate(provider, modelId) {
       testVia: "direct",
       modelId,
       ...guessed,
-      apiBase: "https://models.inference.ai.azure.com",
+      apiBase: "https://models.github.ai/inference",
       apiKeyEnv: "GITHUB_TOKEN",
       litellmModel: `openai/${modelId}`,
-      litellmApiBase: "https://models.inference.ai.azure.com",
+      litellmApiBase: "https://models.github.ai/inference",
       litellmApiKeyEnv: "GITHUB_TOKEN",
     };
   }
@@ -772,6 +840,67 @@ function buildDiscoveredCandidate(provider, modelId) {
     };
   }
 
+  if (provider === "aihubmix") {
+    return {
+      logicalName: `aihubmix-${slugify(modelId, 56)}`,
+      provider,
+      testVia: "direct",
+      modelId,
+      ...guessed,
+      apiBase: "https://aihubmix.com/v1",
+      apiKeyEnv: "AIHUBMIX_API_KEY",
+      litellmModel: `openai/${modelId}`,
+      litellmApiBase: "https://aihubmix.com/v1",
+      litellmApiKeyEnv: "AIHUBMIX_API_KEY",
+    };
+  }
+
+  if (provider === "cerebras") {
+    return {
+      logicalName: `cerebras-${slugify(modelId, 56)}`,
+      provider,
+      testVia: "direct",
+      modelId,
+      ...guessed,
+      apiBase: "https://api.cerebras.ai/v1",
+      apiKeyEnv: "CEREBRAS_API_KEY",
+      litellmModel: `cerebras/${modelId}`,
+      litellmApiKeyEnv: "CEREBRAS_API_KEY",
+    };
+  }
+
+  if (provider === "nvidia") {
+    return {
+      logicalName: `nvidia-${slugify(modelId, 56)}`,
+      provider,
+      testVia: "direct",
+      modelId,
+      ...guessed,
+      apiBase: "https://integrate.api.nvidia.com/v1",
+      apiKeyEnv: "NVIDIA_NIM_API_KEY",
+      litellmModel: `openai/${modelId}`,
+      litellmApiBase: "https://integrate.api.nvidia.com/v1",
+      litellmApiKeyEnv: "NVIDIA_NIM_API_KEY",
+    };
+  }
+
+  if (provider === "gemini") {
+    const directId = String(modelId).replace(/^models\//, "");
+    return {
+      logicalName: `gemini-${slugify(directId, 56)}`,
+      provider,
+      testVia: "direct",
+      modelId: directId,
+      catalogModelId: modelId,
+      ...guessed,
+      apiBase: "https://generativelanguage.googleapis.com/v1beta/openai",
+      apiKeyEnv: "GEMINI_API_KEY",
+      litellmModel: `openai/${directId}`,
+      litellmApiBase: "https://generativelanguage.googleapis.com/v1beta/openai",
+      litellmApiKeyEnv: "GEMINI_API_KEY",
+    };
+  }
+
   return {
     logicalName: `${provider}-${slugify(modelId)}`,
     provider,
@@ -782,15 +911,7 @@ function buildDiscoveredCandidate(provider, modelId) {
 }
 
 function dedupeModels(models) {
-  const out = [];
-  const seen = new Set();
-  for (const model of models) {
-    const key = `${model.provider}:${model.logicalName}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(model);
-  }
-  return out;
+  return dedupeAndNameCandidates(models);
 }
 
 async function sendTelegram(text) {
@@ -811,7 +932,7 @@ async function sendTelegram(text) {
   }
 }
 
-async function testLitellm(modelName) {
+async function testLitellm(model) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), PING_TIMEOUT);
   const start = Date.now();
@@ -824,7 +945,7 @@ async function testLitellm(modelName) {
       },
       signal: controller.signal,
       body: JSON.stringify({
-        model: modelName,
+        model: model.logicalName,
         messages: [{ role: "user", content: PING_PROMPT }],
         temperature: 0,
         max_tokens: PING_MAX_TOKENS,
@@ -835,13 +956,12 @@ async function testLitellm(modelName) {
         fallbacks: [],
       }),
     });
-    clearTimeout(timer);
     const latency = Date.now() - start;
     if (!res.ok) {
-      const txt = await res.text().catch(() => "");
-      return { available: false, latency, error: `HTTP ${res.status}: ${txt.slice(0, 120)}` };
+      try { await res.body?.cancel?.(); } catch { /* complete */ }
+      return failedProbeResult(latency, normalizeProbeFailure(res.status));
     }
-    const body = await res.text().catch(() => "");
+    const body = await readBoundedCompletionBody(res);
     let resolvedModel = null;
     try {
       resolvedModel = JSON.parse(body)?.model || null;
@@ -849,15 +969,11 @@ async function testLitellm(modelName) {
       // ignore
     }
     const content = extractAssistantContent(body);
-    const jsonOk = isParseableJsonResponse(content);
-    return { available: true, latency, resolvedModel, jsonOk, sampleContent: content.slice(0, 80) };
+    return successfulProbeResult(model, { latency, resolvedModel, content });
   } catch (e) {
+    return failedProbeResult(Date.now() - start, normalizeProbeFailure(null, e));
+  } finally {
     clearTimeout(timer);
-    return {
-      available: false,
-      latency: Date.now() - start,
-      error: e.name === "AbortError" ? "timeout" : e.message,
-    };
   }
 }
 
@@ -883,10 +999,10 @@ function isGoneError(error) {
 
 async function testDirect(model, retryOnRateLimit = true) {
   const key = env[model.apiKeyEnv];
-  if (!key) return { available: false, latency: 0, error: `no ${model.apiKeyEnv}` };
+  if (!key) return failedProbeResult(0, `no ${model.apiKeyEnv}`);
 
   if (model.provider === "zen" && _zenNoCredits && !isZenFreeModel(model)) {
-    return { available: false, latency: 0, error: "zen: no credits (balance empty)" };
+    return failedProbeResult(0, "zen: no credits (balance empty)");
   }
 
   const controller = new AbortController();
@@ -909,33 +1025,35 @@ async function testDirect(model, retryOnRateLimit = true) {
         // reject unknown properties with HTTP 400 (false "unavailable").
       }),
     });
-    clearTimeout(timer);
+    const body = await readBoundedCompletionBody(res);
     const latency = Date.now() - start;
     if (!res.ok) {
-      const txt = await res.text().catch(() => "");
       // 429 = rate-limited, not broken. Retry once after a short delay so the
       // health check doesn't permanently exclude a working model just because
       // two tests from the same provider ran back-to-back.
       if (res.status === 429 && retryOnRateLimit) {
+        clearTimeout(timer);
         await new Promise(r => setTimeout(r, 3000));
         return testDirect(model, false);
       }
-      if (model.provider === "zen" && /CreditsError|Insufficient balance/i.test(txt)) {
+      if (model.provider === "zen" && /CreditsError|Insufficient balance/i.test(body)) {
         _zenNoCredits = true;
       }
-      return { available: false, latency, error: `HTTP ${res.status}: ${txt.slice(0, 120)}` };
+      return failedProbeResult(latency, normalizeProbeFailure(res.status));
     }
-    const body = await res.text().catch(() => "");
     const content = extractAssistantContent(body);
-    const jsonOk = isParseableJsonResponse(content);
-    return { available: true, latency, resolvedModel: model.modelId, jsonOk, sampleContent: content.slice(0, 80) };
+    const probeContractOk = isExactPingResponse(content);
+    if (model.provider === "aihubmix") {
+      const classified = classifyAiHubMixCompletion(body, probeContractOk);
+      if (!classified.available) {
+        return failedProbeResult(latency, classified.error, { jsonOk: false });
+      }
+    }
+    return successfulProbeResult(model, { latency, resolvedModel: model.modelId, content });
   } catch (e) {
+    return failedProbeResult(Date.now() - start, normalizeProbeFailure(null, e));
+  } finally {
     clearTimeout(timer);
-    return {
-      available: false,
-      latency: Date.now() - start,
-      error: e.name === "AbortError" ? "timeout" : e.message,
-    };
   }
 }
 
@@ -945,12 +1063,20 @@ function stripAnsi(str) {
 
 async function testOpencodeCli(model) {
   const key = env[model.apiKeyEnv];
-  if (!key) return { available: false, latency: 0, error: `no ${model.apiKeyEnv}` };
+  if (!key) return failedProbeResult(0, `no ${model.apiKeyEnv}`);
 
   const start = Date.now();
   try {
-    const modelFlag = model.modelId ? ` --model ${model.modelId}` : "";
-    const stdout = execSync(`/root/.opencode/bin/opencode run --dangerously-skip-permissions${modelFlag} -`, {
+    const titleId = slugify(model.modelId || model.logicalName || "default", 48) || "default";
+    const args = [
+      "run",
+      "--dangerously-skip-permissions",
+      "--title",
+      `__mimule_probe_v1__:model-health:availability:${titleId}`,
+    ];
+    if (model.modelId) args.push("--model", model.modelId);
+    args.push("-");
+    const stdout = execFileSync("/root/.opencode/bin/opencode", args, {
       encoding: "utf8",
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env, OPENCODE_ZEN_KEY: key },
@@ -960,156 +1086,29 @@ async function testOpencodeCli(model) {
     const latency = Date.now() - start;
     const lines = stripAnsi(stdout).split("\n").map(l => l.trim()).filter(Boolean);
     const content = lines.filter(l => !l.startsWith("> ")).pop() || "";
-    const jsonOk = isParseableJsonResponse(content);
-    return { available: true, latency, jsonOk, sampleContent: content.slice(0, 80) };
+    return successfulProbeResult(model, { latency, content });
   } catch (e) {
     const latency = Date.now() - start;
     const stderr = stripAnsi(e.stderr?.toString() || "");
     const msg = stderr || e.message || "";
     if (msg.includes("Insufficient balance")) {
-      return { available: false, latency, error: "insufficient balance" };
+      return failedProbeResult(latency, "insufficient balance");
     }
     if (msg.includes("timeout") || msg.includes("ETIMEDOUT") || e.code === "ETIMEDOUT") {
-      return { available: false, latency, error: "timeout" };
+      return failedProbeResult(latency, "timeout");
     }
-    return { available: false, latency, error: msg.slice(0, 120) };
+    return failedProbeResult(latency, "cli_error");
   }
 }
 
 async function testCandidate(model) {
   if (model.testVia === "litellm") {
-    return testLitellm(model.logicalName);
+    return testLitellm(model);
   }
   if (model.testVia === "opencode") {
     return testOpencodeCli(model);
   }
   return testDirect(model);
-}
-
-async function fetchJson(url, headers = {}) {
-  const res = await fetch(url, { headers });
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status}`);
-  }
-  return res.json();
-}
-
-async function fetchOpenRouterFreeModels() {
-  if (!OPENROUTER_KEY) return [];
-  try {
-    const data = await fetchJson("https://openrouter.ai/api/v1/models", {
-      Authorization: `Bearer ${OPENROUTER_KEY}`,
-    });
-    return (data.data || [])
-      .filter(model =>
-        String(model.pricing?.prompt) === "0" &&
-        String(model.pricing?.completion) === "0" &&
-        !DISCOVERY_EXCLUDE.has(model.id) &&
-        !isEditorialIncompatible(model.id)
-      )
-      .map(model => buildDiscoveredCandidate("openrouter", model.id));
-  } catch (e) {
-    console.log(`  [discover:openrouter] skipped: ${e.message}`);
-    return [];
-  }
-}
-
-function isGithubChatModel(model) {
-  return String(model.task || "").toLowerCase() === "chat-completion";
-}
-
-async function fetchGithubCatalogModels() {
-  if (!GITHUB_TOKEN || !DISCOVERY_ASSUMPTIONS.githubAsFree) return [];
-  try {
-    const data = await fetchJson("https://models.inference.ai.azure.com/models", {
-      Authorization: `Bearer ${GITHUB_TOKEN}`,
-    });
-    return (data || [])
-      .filter(isGithubChatModel)
-      .map(model => buildDiscoveredCandidate("github", model.name))
-      .filter(model =>
-        !DISCOVERY_EXCLUDE.has(model.modelId) &&
-        !isEditorialIncompatible(model.modelId, model.logicalName)
-      );
-  } catch (e) {
-    console.log(`  [discover:github] skipped: ${e.message}`);
-    return [];
-  }
-}
-
-async function fetchGroqCatalogModels() {
-  if (!GROQ_KEY || !DISCOVERY_ASSUMPTIONS.groqAsFree) return [];
-  try {
-    const data = await fetchJson("https://api.groq.com/openai/v1/models", {
-      Authorization: `Bearer ${GROQ_KEY}`,
-    });
-    return (data.data || [])
-      .map(model => buildDiscoveredCandidate("groq", model.id))
-      .filter(model =>
-        !DISCOVERY_EXCLUDE.has(model.modelId) &&
-        !isEditorialIncompatible(model.modelId, model.logicalName)
-      );
-  } catch (e) {
-    console.log(`  [discover:groq] skipped: ${e.message}`);
-    return [];
-  }
-}
-
-async function fetchZenCatalogModels() {
-  if (!ZEN_KEY) return [];
-  const documentedFree = [...ZEN_DOCUMENTED_FREE_MODEL_IDS, ...ZEN_GO_FALLBACK_MODEL_IDS]
-    .map(modelId => buildDiscoveredCandidate("zen", modelId));
-
-  // Primary source: the live OpenCode Zen catalog (/v1/models) — the authoritative,
-  // current set of model IDs (paid + free). Using it means discovery never carries
-  // stale/renamed IDs. Paid models are skipped by the credit short-circuit when the
-  // balance is empty; free models (and any model once credits exist) probe with correct IDs.
-  try {
-    const data = await fetchJson("https://opencode.ai/zen/v1/models", {
-      Authorization: `Bearer ${ZEN_KEY}`,
-    });
-    const live = (data.data || data.models || [])
-      .map(model => model.id)
-      .filter(Boolean)
-      .map(modelId => buildDiscoveredCandidate("zen", modelId))
-      .filter(model =>
-        !DISCOVERY_EXCLUDE.has(model.modelId) &&
-        !isEditorialIncompatible(model.modelId, model.logicalName)
-      );
-    if (live.length > 0) {
-      console.log(`  [discover:zen] ${live.length} models from live /v1/models`);
-      return dedupeModels(live);
-    }
-    console.log("  [discover:zen] live /v1/models returned no usable models — falling back to CLI/documented");
-  } catch (e) {
-    console.log(`  [discover:zen] live /v1/models unavailable (${e.message}) — falling back to CLI/documented`);
-  }
-
-  // Fallback 1: opencode CLI catalog (may be stale; used only when the live API is down).
-  try {
-    const stdout = execSync("/root/.opencode/bin/opencode models opencode", {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, OPENCODE_ZEN_KEY: ZEN_KEY },
-    });
-    const cliModels = stdout
-      .split("\n")
-      .map(line => line.trim())
-      .filter(Boolean)
-      .filter(line => line.startsWith("opencode/"))
-      .map(line => line.replace(/^opencode\//, ""))
-      .filter(modelId =>
-        !DISCOVERY_EXCLUDE.has(modelId) &&
-        !isEditorialIncompatible(modelId)
-      )
-      .map(modelId => buildDiscoveredCandidate("zen", modelId));
-    if (cliModels.length > 0) return dedupeModels([...documentedFree, ...cliModels]);
-  } catch (e) {
-    console.log(`  [discover:zen] CLI fallback unavailable: ${e.message}`);
-  }
-
-  // Fallback 2: documented free IDs only.
-  return documentedFree;
 }
 
 // Alibaba models are accessible through the opencode CLI but not through the Zen API.
@@ -1126,34 +1125,6 @@ const ALIBABA_CANDIDATES = [
   "alibaba/qwen3.5-plus",
   "alibaba/qwen3-next-80b-a3b-instruct",
 ];
-
-async function fetchAlibabaModels() {
-  if (!ZEN_KEY) return [];
-  try {
-    const stdout = execSync("/root/.opencode/bin/opencode models", {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, OPENCODE_ZEN_KEY: ZEN_KEY },
-      timeout: 10000,
-    });
-    const available = new Set(
-      stdout.split("\n").map(l => l.trim()).filter(l => l.startsWith("alibaba/"))
-    );
-    return ALIBABA_CANDIDATES
-      .filter(id => available.has(id))
-      .map(id => ({
-        logicalName: id,
-        provider: "alibaba",
-        testVia: "opencode",
-        modelId: id,
-        ...guessCapability(id),
-        apiKeyEnv: "OPENCODE_ZEN_KEY",
-      }));
-  } catch (e) {
-    console.log(`  [discover:alibaba] CLI unavailable: ${e.message}`);
-    return [];
-  }
-}
 
 // opencode-go models — Go subscription tier, CLI-only (no REST endpoint).
 // Not routable via LiteLLM; used by autopipeline when calling opencode CLI directly.
@@ -1172,31 +1143,32 @@ const OPENCODE_GO_CANDIDATES = [
   "opencode-go/qwen3.5-plus",
 ];
 
-async function fetchOpencodeGoModels() {
-  if (!ZEN_KEY) return [];
+function collectCliInventories() {
+  if (!ZEN_KEY) return {};
   try {
-    const stdout = execSync("/root/.opencode/bin/opencode models", {
+    const stdout = execFileSync("/root/.opencode/bin/opencode", ["models"], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
       env: { ...process.env, OPENCODE_ZEN_KEY: ZEN_KEY },
-      timeout: 10000,
+      timeout: 10_000,
     });
-    const available = new Set(
-      stdout.split("\n").map(l => l.trim()).filter(l => l.startsWith("opencode-go/"))
-    );
-    return OPENCODE_GO_CANDIDATES
-      .filter(id => available.has(id))
-      .map(id => ({
-        logicalName: id,
-        provider: "opencode",
-        testVia: "opencode",
-        modelId: id,
-        ...guessCapability(id),
-        apiKeyEnv: "OPENCODE_ZEN_KEY",
-      }));
-  } catch (e) {
-    console.log(`  [discover:opencode-go] CLI unavailable: ${e.message}`);
-    return [];
+    const lines = stdout.split("\n").map(line => line.trim()).filter(Boolean);
+    const alibaba = lines.filter(line => line.startsWith("alibaba/"));
+    const opencode = lines.filter(line => line.startsWith("opencode-go/"));
+    return {
+      alibaba: {
+        complete: true,
+        rawIds: alibaba,
+        eligibleIds: alibaba.filter(id => ALIBABA_CANDIDATES.includes(id)),
+      },
+      opencode: {
+        complete: true,
+        rawIds: opencode,
+        eligibleIds: opencode.filter(id => OPENCODE_GO_CANDIDATES.includes(id)),
+      },
+    };
+  } catch {
+    return {};
   }
 }
 
@@ -1211,85 +1183,28 @@ const OPENCODE_CLI_ONLY_MODELS = new Set([
 // Add CLI-only models to the cloud exclusion set after both are defined.
 for (const m of OPENCODE_CLI_ONLY_MODELS) CLOUD_EXCLUDE.add(m);
 
-// Cloudflare Workers AI text-generation models compatible with editorial pipeline.
-// Skips vision-only, image-gen, reasoning-only, embedding, and classifier models.
-// The known-good list acts as a static fallback if the API is unreachable.
-const CF_KNOWN_GOOD = [
-  "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
-  "@cf/meta/llama-4-scout-17b-16e-instruct",
-  "@cf/meta/llama-3.1-8b-instruct",
-];
-const CF_COMPATIBLE_INCOMPATIBLE = /lora$|lora-|\bguard\b|vision|image|embedding|sql|math|whisper|tts/i;
-
-const CF_PREFERRED_PREFIXES = ["@cf/meta/", "@cf/mistral/", "@cf/qwen/", "@cf/google/", "@cf/deepseek/"];
-const CF_MAX_DISCOVERED = 12;
-
-async function fetchCloudflareModels() {
-  if (!CF_TOKEN || !CF_ACCOUNT_ID) {
-    console.log("  [discover:cloudflare] CLOUDFLARE_API_TOKEN or CLOUDFLARE_ACCOUNT_ID not set — skipping");
-    return CF_KNOWN_GOOD.map(id => buildDiscoveredCandidate("cloudflare", id));
-  }
-  try {
-    const data = await fetchJson(
-      `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/models/search?task=Text+Generation&per_page=100`,
-      { Authorization: `Bearer ${CF_TOKEN}` },
-    );
-    const models = Array.isArray(data.result) ? data.result : [];
-    const candidates = models
-      .map(m => (typeof m === "string" ? m : m?.name || ""))
-      .filter(Boolean)
-      .filter(id => !CF_COMPATIBLE_INCOMPATIBLE.test(id) && !isEditorialIncompatible(id))
-      // Exclude reasoning-only models confirmed to return null content (thinking goes to reasoning_content)
-      .filter(id => !id.includes("qwen3") && !id.includes("kimi") && !id.includes("deepseek-r1"))
-      // Prefer well-known providers; skip deprecated third-party HF models
-      .filter(id => CF_PREFERRED_PREFIXES.some(p => id.startsWith(p)) || CF_KNOWN_GOOD.includes(id))
-      .slice(0, CF_MAX_DISCOVERED)
-      .map(id => buildDiscoveredCandidate("cloudflare", id))
-      .filter(m => m.apiBase); // skip if CF_API_BASE is null (no account ID)
-    if (candidates.length > 0) {
-      console.log(`  [discover:cloudflare] ${candidates.length} eligible text-gen models`);
-      return dedupeModels(candidates);
-    }
-    throw new Error("empty model list");
-  } catch (e) {
-    console.log(`  [discover:cloudflare] API error (${e.message}) — using known-good fallback list`);
-    return CF_KNOWN_GOOD
-      .map(id => buildDiscoveredCandidate("cloudflare", id))
-      .filter(m => m.apiBase);
-  }
-}
-
-function isInLitellmConfig(logicalName, modelId) {
-  const cfg = fs.readFileSync(LITELLM_CFG, "utf8");
-  return cfg.includes(`model_name: ${logicalName}`);
-}
-
-function addToLitellmConfig(model) {
-  if (!model.litellmModel) return false;
-  if (isInLitellmConfig(model.logicalName, model.modelId)) return false;
-
-  let entry = `\n  - model_name: ${model.logicalName}\n    litellm_params:\n      model: ${model.litellmModel}\n`;
-  if (model.litellmApiBase) entry += `      api_base: ${model.litellmApiBase}\n`;
-  entry += `      api_key: os.environ/${model.litellmApiKeyEnv}\n      timeout: 60\n`;
-
-  const cfg = fs.readFileSync(LITELLM_CFG, "utf8");
-  const insertBefore = "\n# Fallback chains:";
-  if (!cfg.includes(insertBefore)) return false;
-  fs.writeFileSync(LITELLM_CFG, cfg.replace(insertBefore, entry + insertBefore), "utf8");
-  return true;
-}
-
 // Produce the fallback recommendation stored in model-health.json. This function is
 // deliberately pure: model-fallback-reprobe.py is the sole owner of LiteLLM fallback
-// chain writes, while this health check may still register and hot-add new model entries.
-function buildFallbackPlan(ranked) {
+// chain writes; discovery emits apply evidence but never registers, hot-adds, or restarts.
+function buildFallbackPlan(ranked, dynamicBilling = {}) {
   const dedupe = arr => [...new Set(arr.filter(Boolean))];
   const withoutPaid = arr => arr.filter(model => !PAID_LAST_RESORT_MODELS.has(model));
   const paidOnly = arr => arr.filter(model => PAID_LAST_RESORT_MODELS.has(model));
+  const isPreLocal = model => {
+    const billing = dynamicBilling[model];
+    if (!billing) return true; // static/manual route ordering is unchanged
+    return billing.pricingEvidence === "verified-zero-price"
+      && billing.autoPromotionPolicy === "automatic-verified-zero"
+      && billing.rotationClass === "free-first";
+  };
+  const preLocal = arr => withoutPaid(arr).filter(isPreLocal);
+  const postLocal = arr => withoutPaid(arr).filter(model => !isPreLocal(model));
 
-  const freeHeavy = withoutPaid(ranked.heavy);
+  const freeHeavy = preLocal(ranked.heavy);
+  const postHeavy = postLocal(ranked.heavy);
   const paidHeavy = paidOnly(ranked.heavy);
-  const freeMedium = withoutPaid(ranked.medium);
+  const freeMedium = preLocal(ranked.medium);
+  const postMedium = postLocal(ranked.medium);
   const paidMedium = paidOnly(ranked.medium);
 
   // Cloud chains (autopipeline cloud stages: research, write, publish-prep)
@@ -1300,6 +1215,8 @@ function buildFallbackPlan(ranked) {
     ...freeMedium,
     "github-gpt41",
     "editorial-heavy",
+    ...postHeavy,
+    ...postMedium,
     ...paidHeavy,
     ...paidMedium,
   ]);
@@ -1309,6 +1226,8 @@ function buildFallbackPlan(ranked) {
     ...freeHeavy.slice(0, 3),
     "github-gpt41",
     "editorial-fast",
+    ...postMedium,
+    ...postHeavy.slice(0, 3),
     ...paidHeavy.slice(0, 1),
     ...paidMedium,
   ]);
@@ -1320,6 +1239,8 @@ function buildFallbackPlan(ranked) {
     ...freeHeavy,
     ...freeMedium,
     "editorial-cloud-heavy",
+    ...postHeavy,
+    ...postMedium,
     ...paidHeavy,
     ...paidMedium,
   ]);
@@ -1328,6 +1249,8 @@ function buildFallbackPlan(ranked) {
     ...freeMedium,
     ...freeHeavy.slice(0, 3),
     "editorial-cloud-fast",
+    ...postMedium,
+    ...postHeavy.slice(0, 3),
     ...paidHeavy.slice(0, 1),
     ...paidMedium,
   ]);
@@ -1336,6 +1259,7 @@ function buildFallbackPlan(ranked) {
   const cheapFallback = dedupe([
     ...freeMedium,
     ...ranked.light.slice(0, 2),
+    ...postMedium,
     ...paidMedium,
   ]);
 
@@ -1344,6 +1268,8 @@ function buildFallbackPlan(ranked) {
     ...freeMedium.slice(0, 2),
     ...freeHeavy.slice(0, 1),
     "github-gpt4o-mini",
+    ...postMedium.slice(0, 2),
+    ...postHeavy.slice(0, 1),
   ]);
 
   return {
@@ -1365,24 +1291,64 @@ function loadQuality() {
 }
 
 function getPolicyForResult(result, policy) {
-  return (
-    policy.models?.[result.logicalName] ||
-    (result.modelId ? policy.models?.[result.modelId] : null) ||
-    null
-  );
+  return lookupModelEntry(policy.models, result);
 }
 
 function getQualityForResult(result, quality) {
-  return (
-    (result.modelId ? quality.models?.[result.modelId] : null) ||
-    quality.models?.[result.logicalName] ||
-    null
-  );
+  return lookupModelEntry(quality.models, result);
 }
 
 function applyQualityAndPolicy(result, quality, policy) {
   const policyEntry = getPolicyForResult(result, policy) || {};
   const qualityEntry = getQualityForResult(result, quality) || {};
+  if (result.displayOnly === true || result.legacyProvenance === "unclassified-legacy-v1") {
+    return {
+      ...result,
+      effectiveStatus: "legacy_provenance_quarantine",
+      effectiveCapability: null,
+      qualityBucket: 99,
+      qualityEntry,
+      policyEntry,
+    };
+  }
+  if (result.activationPending === true) {
+    return { ...result, effectiveStatus: "activation_pending", effectiveCapability: null, qualityBucket: 99 };
+  }
+  if (result.credentialBlocked === true) {
+    return { ...result, effectiveStatus: `credential_${result.credentialStatus || "blocked"}`, effectiveCapability: null, qualityBucket: 99 };
+  }
+  if (result.dynamicProvenance === "catalog-auto-v1" && result.catalogEligibility !== "eligible") {
+    return {
+      ...result,
+      effectiveStatus: result.catalogEligibility === "ineligible" ? "catalog_ineligible" : "catalog_unknown",
+      effectiveCapability: null,
+      qualityBucket: 99,
+      qualityEntry,
+      policyEntry,
+    };
+  }
+  if (result.dynamicProvenance === "catalog-auto-v1"
+    && result.autoPromotionPolicy === "manual-approval-required"
+    && !hasExplicitBillingApproval(policyEntry)) {
+    return {
+      ...result,
+      effectiveStatus: "billing_approval_required",
+      effectiveCapability: null,
+      qualityBucket: 99,
+      qualityEntry,
+      policyEntry,
+    };
+  }
+  if (result.probeContractRequired === true && result.probeContractOk !== true) {
+    return {
+      ...result,
+      effectiveStatus: "probe_contract_unproven",
+      effectiveCapability: null,
+      qualityBucket: 99,
+      qualityEntry,
+      policyEntry,
+    };
+  }
   const effectiveStatus = policyEntry.forceBlock
     ? "blocked"
     : policyEntry.forceAllow
@@ -1488,23 +1454,156 @@ function shouldForceFullFromQuick(previous, ranked, now) {
   return false;
 }
 
-async function buildFullCandidateSet() {
-  const discovered = await Promise.all([
-    fetchOpenRouterFreeModels(),
-    fetchGithubCatalogModels(),
-    fetchGroqCatalogModels(),
-    fetchZenCatalogModels(),
-    fetchCloudflareModels(),
-    fetchAlibabaModels(),
-    fetchOpencodeGoModels(),
-  ]);
+function modelIdMatchesCatalogId(left, right) {
+  const a = String(left || "");
+  const b = String(right || "");
+  return a === b || a === `models/${b}` || b === `models/${a}`;
+}
 
-  const all = dedupeModels([
-    ...MODEL_REGISTRY,
-    ...discovered.flat(),
-  ]);
+function catalogEligibilityFor(inventory, catalogModelId) {
+  if (!inventory || inventory.complete !== true) return "unknown";
+  if ((inventory.pendingRemovalIds || []).some(id => modelIdMatchesCatalogId(id, catalogModelId))) return "unknown";
+  if ((inventory.eligibleIds || []).some(id => modelIdMatchesCatalogId(id, catalogModelId))) return "eligible";
+  return "ineligible";
+}
 
-  return all;
+function seedCatalogBaseline(previousCatalog, previousModels, now) {
+  const seeded = previousCatalog && typeof previousCatalog === "object"
+    ? { ...previousCatalog, providers: { ...(previousCatalog.providers || {}) } }
+    : { generatedAt: now, providers: {} };
+  for (const model of previousModels || []) {
+    if (!isExplicitCatalogDynamic(model)) continue;
+    const provider = String(model.provider || "");
+    const modelId = String(model.catalogModelId || model.modelId || "");
+    if (!provider || !modelId) continue;
+    try { assertSafeProviderModelId(modelId); } catch { continue; }
+    const prior = seeded.providers[provider] || {};
+    seeded.providers[provider] = {
+      ...prior,
+      rawIds: [...new Set([...(prior.rawIds || []), modelId])],
+      eligibleIds: [...new Set([...(prior.eligibleIds || []), modelId])],
+    };
+  }
+  return seeded;
+}
+
+function priorDynamicRoutes(previousCatalog) {
+  const source = previousCatalog?.dynamicRoutes;
+  if (Array.isArray(source)) return source;
+  if (source && typeof source === "object") return Object.values(source);
+  return [];
+}
+
+async function buildFullCandidateSet(previousCatalog = null, now = Date.now(), previousModels = []) {
+  const cliInventories = collectCliInventories();
+  const baseline = seedCatalogBaseline(previousCatalog, previousModels, now);
+  const catalog = await collectModelCatalog({ env, previous: baseline, cliInventories, now });
+  const discovered = [];
+  for (const [provider, inventory] of Object.entries(catalog.providers || {})) {
+    for (const modelId of inventory.eligibleIds || []) {
+      if (DISCOVERY_EXCLUDE.has(modelId) || isEditorialIncompatible(modelId)) continue;
+      const catalogEligibility = catalogEligibilityFor(inventory, modelId);
+      if (provider === "alibaba" || provider === "opencode") {
+        discovered.push(withDynamicCatalogProvenance({
+          logicalName: modelId,
+          provider,
+          testVia: "opencode",
+          modelId,
+          ...guessCapability(modelId),
+          apiKeyEnv: "OPENCODE_ZEN_KEY",
+          catalogEligibility,
+        }, provider, modelId));
+        continue;
+      }
+      const candidate = buildDiscoveredCandidate(provider, modelId);
+      if (candidate?.apiBase || candidate?.testVia === "litellm") {
+        const registryMatch = findRegistryMatch(provider, modelId);
+        discovered.push(registryMatch
+          ? candidate
+          : withDynamicCatalogProvenance({ ...candidate, catalogEligibility }, provider, modelId));
+      }
+    }
+  }
+
+  // A failed/partial adapter must not make an already known auto-discovered
+  // route disappear. Complete authoritative ineligibility is retained as a
+  // quarantined health row so the reason remains visible and Python can prune
+  // it from the live fallback rotation.
+  let candidates = mergeCatalogCandidates(MODEL_REGISTRY, previousModels, discovered);
+  const currentIdentities = new Set(candidates.map(candidateIdentity));
+  for (const previous of previousModels || []) {
+    if (!isExplicitCatalogDynamic(previous) || currentIdentities.has(candidateIdentity(previous))) continue;
+    const inventory = catalog.providers?.[previous.provider];
+    const catalogModelId = previous.catalogModelId || previous.modelId;
+    if (!inventory || !catalogModelId) continue;
+    const retained = withDynamicCatalogProvenance({
+      ...previous,
+      catalogEligibility: catalogEligibilityFor(inventory, catalogModelId),
+      catalogCarryForward: inventory.complete !== true,
+    }, previous.provider, catalogModelId);
+    candidates.push(retained);
+    currentIdentities.add(candidateIdentity(retained));
+  }
+  candidates = dedupeModels(candidates);
+
+  const routeByLogical = new Map();
+  for (const model of candidates) {
+    if (model.dynamicProvenance !== "catalog-auto-v1") continue;
+    const inventory = catalog.providers?.[model.provider];
+    const catalogModelId = model.catalogModelId || model.modelId;
+    const eligibility = catalogEligibilityFor(inventory, catalogModelId);
+    const admission = dynamicProviderAdmissionPolicy(model.provider);
+    if (!admission) continue;
+    model.catalogEligibility = eligibility;
+    model.catalogComplete = inventory?.complete === true;
+    model.catalogObservedAt = catalog.generatedAt;
+    routeByLogical.set(model.logicalName, {
+      logicalName: model.logicalName,
+      provider: model.provider,
+      modelId: catalogModelId,
+      provenance: "catalog-auto-v1",
+      ...admission,
+      catalogComplete: inventory?.complete === true,
+      eligibility,
+    });
+  }
+  for (const prior of priorDynamicRoutes(previousCatalog)) {
+    if (!prior?.logicalName || routeByLogical.has(prior.logicalName)) continue;
+    const inventory = catalog.providers?.[prior.provider];
+    const modelId = prior.modelId;
+    const admission = dynamicProviderAdmissionPolicy(prior.provider);
+    if (!admission) continue;
+    try {
+      assertSafeProviderModelId(prior.logicalName, "logical model name");
+      assertSafeProviderModelId(modelId);
+    } catch { continue; }
+    routeByLogical.set(prior.logicalName, {
+      logicalName: prior.logicalName,
+      provider: prior.provider,
+      modelId,
+      provenance: "catalog-auto-v1",
+      ...admission,
+      catalogComplete: inventory?.complete === true,
+      eligibility: catalogEligibilityFor(inventory, modelId),
+    });
+  }
+  catalog.dynamicRoutes = [...routeByLogical.values()].slice(0, 10_000);
+  catalog.diffSummary = {};
+  for (const [provider, inventory] of Object.entries(catalog.providers || {})) {
+    const diff = {
+      added: inventory.addedIds?.length || 0,
+      removed: inventory.removedIds?.length || 0,
+      eligibilityAdded: inventory.eligibleAddedIds?.length || 0,
+      eligibilityRemoved: inventory.eligibleRemovedIds?.length || 0,
+    };
+    catalog.diffSummary[provider] = diff;
+    if (Object.values(diff).some(Boolean)) {
+      console.log(`Catalog diff [${provider}]: +${diff.added}/-${diff.removed}, eligible +${diff.eligibilityAdded}/-${diff.eligibilityRemoved}`);
+    }
+  }
+  const forbiddenValues = ALLOWED_CREDENTIAL_ENV_NAMES.map(name => env[name]).filter(Boolean);
+  writeModelCatalogAtomic(MODEL_CATALOG_FILE, catalog, forbiddenValues);
+  return { candidates, catalog };
 }
 
 function buildQuickCandidateSet(previous) {
@@ -1512,9 +1611,9 @@ function buildQuickCandidateSet(previous) {
   const priorMap = new Map(priorModels.map(m => [m.logicalName, m]));
 
   // Quick mode: include ALL registry models and ALL prior models so the
-  // dashboard stays complete and nothing disappears. Only local models
-  // are actually tested; everything else is copy-forwarded by testCandidateSet.
-  const all = dedupeModels([...MODEL_REGISTRY, ...priorModels]);
+  // dashboard stays complete and nothing disappears. Cloud probes retain the
+  // existing new/nonhealthy/stale policy; catalog redemption stays full-only.
+  const all = mergeCatalogCandidates(MODEL_REGISTRY, priorModels, []);
   const enriched = all.map(model => {
     const prior = priorMap.get(model.logicalName);
     return prior ? { ...prior, ...model } : model;
@@ -1523,61 +1622,68 @@ function buildQuickCandidateSet(previous) {
   return enriched;
 }
 
-function shouldTestModel(model, prev, quality) {
-  // Always test local models (GPU tunnel health is critical)
-  if (model.provider === "local") return true;
-
-  // Test models we have never seen before
-  if (!prev) return true;
-
-  // Test models with non-healthy quality status (probation, degraded, blocked)
-  const q = quality?.models?.[model.logicalName];
-  if (q && q.status && q.status !== "healthy") return true;
-
-  // Re-test healthy cloud models that have gone stale, so silently-dead providers
-  // get caught and recovered models get re-promoted (capped per run by the caller).
-  // Only lastTestedAt counts as a real probe — checkedAt is re-stamped on every
-  // copy-forward, so using it here would reset the staleness clock forever
-  // (2026-07-03: dead cerebras models stayed "available: true" for weeks).
-  if (!prev.lastTestedAt) return "stale";
-  if (Date.now() - prev.lastTestedAt > AVAILABILITY_RETEST_MS) return "stale";
-  return false;
-}
-
-async function testCandidateSet(candidates, now, prevMap, quality) {
-  const toTest = [];
-  const toCopy = [];
-
-  const staleCandidates = [];
-  for (const model of candidates) {
-    const prev = prevMap.get(model.logicalName);
-    const decision = shouldTestModel(model, prev, quality);
-    if (decision === true) {
-      toTest.push(model);
-    } else if (decision === "stale") {
-      staleCandidates.push(model);
-    } else {
-      // Copy-forward path: prev result preserved, registry fields refreshed,
-      // pricingTier recomputed every cycle so taxonomy changes propagate
-      // without waiting for a re-probe. lastTestedAt must survive untouched —
-      // it is the staleness clock and only a real probe may advance it.
-      toCopy.push({ ...prev, ...model, lastTestedAt: prev.lastTestedAt ?? null, checkedAt: now, pricingTier: pricingTierFor(model) });
+async function testCandidateSet(candidates, now, prevMap, quality, policy, {
+  mode = "quick",
+  catalog = null,
+} = {}) {
+  const prevByIdentity = new Map([...prevMap.values()].map(previous => [candidateIdentity(previous), previous]));
+  const previousFor = model => prevMap.get(model.logicalName) || prevByIdentity.get(candidateIdentity(model));
+  const planned = planModelProbeQueue(candidates, {
+    mode,
+    previousModels: prevMap,
+    quality,
+    policy,
+    catalog,
+    now,
+    staleAfterMs: AVAILABILITY_RETEST_MS,
+    staleCap: AVAILABILITY_RETEST_MAX,
+    redemptionPerProvider: REDEMPTION_PER_PROVIDER,
+    redemptionGlobal: REDEMPTION_GLOBAL,
+    newPerProvider: NEW_PROBE_PER_PROVIDER,
+    newGlobal: NEW_PROBE_GLOBAL,
+  });
+  const toTest = planned.probe;
+  const toCopy = planned.copy.map(({ model, reason }) => {
+    const prev = previousFor(model);
+    const copied = {
+      ...prev,
+      ...model,
+      lastTestedAt: prev?.lastTestedAt ?? null,
+      checkedAt: now,
+      pricingTier: pricingTierFor(model),
+      probeSucceededThisRun: false,
+      copyForwardReason: reason,
+    };
+    if (!prev || reason === "new_capped" || reason === "new_full_only") {
+      copied.available = null;
+      copied.probeDeferred = true;
     }
-  }
-  // Never-really-probed first, then oldest real probe; cap re-pings per run.
-  const lastTestedOf = (name) => prevMap.get(name)?.lastTestedAt ?? 0;
-  staleCandidates.sort((a, b) => lastTestedOf(a.logicalName) - lastTestedOf(b.logicalName));
-  for (let i = 0; i < staleCandidates.length; i++) {
-    const model = staleCandidates[i];
-    if (i < AVAILABILITY_RETEST_MAX) {
-      toTest.push(model);
-    } else {
-      const prev = prevMap.get(model.logicalName);
-      toCopy.push({ ...prev, ...model, lastTestedAt: prev.lastTestedAt ?? null, checkedAt: now, pricingTier: pricingTierFor(model) });
+    if (reason === "catalog_ineligible") {
+      copied.available = false;
+      copied.catalogQuarantined = true;
+      copied.error = "catalog_ineligible";
+    } else if (reason === "catalog_unknown") {
+      copied.catalogQuarantined = true;
+    } else if (reason === "billing_approval_required") {
+      copied.available = null;
+      copied.billingApprovalRequired = true;
+      copied.error = "billing_approval_required";
+    } else if (reason.startsWith("credential_")) {
+      copied.available = false;
+      copied.credentialBlocked = true;
+      copied.error = reason;
+    } else if (reason === "legacy_provenance_quarantine") {
+      copied.available = null;
+      copied.probeDeferred = true;
+      copied.displayOnly = true;
+      copied.routingEligible = false;
+      copied.error = reason;
     }
-  }
+    if (model.probeContractRequired === true && prev?.probeContractOk !== true) copied.available = null;
+    return copied;
+  });
 
-  console.log(`\nTesting ${toTest.length} models (${toCopy.length} copy-forwarded)...`);
+  console.log(`\nTesting ${toTest.length} models (${planned.redemptionCount} redemption, ${toCopy.length} copy-forwarded)...`);
   const results = [...toCopy];
 
   // Separate CLI-based tests from API-based tests
@@ -1599,7 +1705,7 @@ async function testCandidateSet(candidates, now, prevMap, quality) {
         : `❌ ${String(status.error || "unavailable").slice(0, 80)}`;
       const keyMissing = status.error?.startsWith("no ") ? " (key not set)" : "";
       console.log(`  [${model.provider.padEnd(10)}] ${model.logicalName}: ${printable}${keyMissing}`);
-      return { ...model, ...status, checkedAt: now, lastTestedAt: now, pricingTier: pricingTierFor(model) };
+      return { ...model, ...status, probeDeferred: false, checkedAt: now, lastTestedAt: now, pricingTier: pricingTierFor(model) };
     }));
     results.push(...batchResults);
     if (i + batchSize < apiCandidates.length) {
@@ -1619,14 +1725,14 @@ async function testCandidateSet(candidates, now, prevMap, quality) {
       : `❌ ${String(status.error || "unavailable").slice(0, 80)}`;
     const keyMissing = status.error?.startsWith("no ") ? " (key not set)" : "";
     console.log(`  [${model.provider.padEnd(10)}] ${model.logicalName}: ${printable}${keyMissing}`);
-    results.push({ ...model, ...status, checkedAt: now, lastTestedAt: now, pricingTier: pricingTierFor(model) });
+    results.push({ ...model, ...status, probeDeferred: false, checkedAt: now, lastTestedAt: now, pricingTier: pricingTierFor(model) });
     if (i < cliCandidates.length - 1) {
       await new Promise(r => setTimeout(r, 2000));
     }
   }
 
   return results.map(r => {
-    const prev = prevMap.get(r.logicalName);
+    const prev = previousFor(r);
     const unavailableSince = (!r.available && isGoneError(r.error))
       ? (prev?.unavailableSince ?? r.checkedAt ?? now)
       : null; // available, or transient failure (429/timeout/5xx/no-credits) — don't retire
@@ -1634,61 +1740,54 @@ async function testCandidateSet(candidates, now, prevMap, quality) {
   });
 }
 
-async function hotAddModel(model) {
-  if (!model.litellmModel) return false;
-  const litellmParams = { model: model.litellmModel, timeout: 60 };
-  if (model.litellmApiBase) litellmParams.api_base = model.litellmApiBase;
-  if (model.litellmApiKeyEnv) litellmParams.api_key = `os.environ/${model.litellmApiKeyEnv}`;
+async function fetchRuntimeModelBindings() {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10_000);
   try {
-    const res = await fetch("http://127.0.0.1:4000/model/new", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${LITELLM_KEY}` },
-      body: JSON.stringify({ model_name: model.logicalName, litellm_params: litellmParams }),
+    const response = await fetch("http://127.0.0.1:4000/model/info", {
+      method: "GET",
+      headers: { Authorization: `Bearer ${LITELLM_KEY}`, Accept: "application/json" },
+      signal: controller.signal,
     });
-    if (!res.ok) {
-      const txt = await res.text().catch(() => "");
-      console.log(`  Hot-add ${model.logicalName}: HTTP ${res.status} — ${txt.slice(0, 100)}`);
-      return false;
+    if (!response.ok) {
+      try { await response.body?.cancel?.(); } catch { /* complete */ }
+      return null;
     }
-    console.log(`  → Hot-activated ${model.logicalName} via /model/new (no restart needed)`);
-    return true;
-  } catch (e) {
-    console.log(`  Hot-add ${model.logicalName} failed: ${e.message}`);
-    return false;
-  }
-}
-
-async function waitForLiteLLMIdle(maxWaitMs = 60_000) {
-  const start = Date.now();
-  while (Date.now() - start < maxWaitMs) {
-    try {
-      const out = execSync("ss -tn state established '( dport = :4000 )' 2>/dev/null | tail -n +2 | wc -l", {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "pipe"],
-      }).trim();
-      if (parseInt(out, 10) === 0) return;
-      console.log(`  ${out} active LiteLLM connection(s) — waiting to drain...`);
-    } catch {
-      return;
+    const parsed = JSON.parse(await readBoundedCompletionBody(response, ACTIVATION_INFO_MAX_BYTES));
+    if (!Array.isArray(parsed?.data) || parsed.data.length > 10_000) return null;
+    const bindings = [];
+    for (const row of parsed.data) {
+      try {
+        const logicalName = assertSafeProviderModelId(row?.model_name ?? row?.modelName, "runtime model");
+        const litellmModel = assertSafeProviderModelId(row?.litellm_params?.model, "runtime LiteLLM model");
+        const provider = assertSafeProviderModelId(row?.model_info?.mimule_catalog_provider, "runtime catalog provider").toLowerCase();
+        const modelId = assertSafeProviderModelId(row?.model_info?.mimule_catalog_model_id, "runtime catalog model");
+        const provenance = row?.model_info?.mimule_catalog_provenance;
+        const bindingIdentity = row?.model_info?.mimule_binding_identity;
+        let litellmApiBase = null;
+        if (row?.litellm_params?.api_base) {
+          const parsedBase = new URL(String(row.litellm_params.api_base));
+          if (!/^https?:$/.test(parsedBase.protocol) || parsedBase.username || parsedBase.password) continue;
+          litellmApiBase = parsedBase.toString().replace(/\/$/, "");
+        }
+        bindings.push({
+          logicalName,
+          litellmModel,
+          litellmApiBase,
+          provider,
+          modelId,
+          provenance,
+          bindingIdentity,
+          malformed: provenance !== "catalog-auto-v1" || !/^[a-f0-9]{64}$/.test(String(bindingIdentity || "")),
+        });
+      } catch { /* ignore malformed row without a safe logical identity */ }
     }
-    await new Promise(resolve => setTimeout(resolve, 3000));
-  }
-  console.log("  Drain timeout reached — proceeding with restart");
-}
-
-async function maybeRestartLiteLLM(needed, reason, mode = "full") {
-  if (!needed) return;
-  if (mode === "quick") {
-    console.log(`\nSkipping LiteLLM restart in quick mode (${reason}) — config updated, will apply on next full run`);
-    return;
-  }
-  console.log(`\nGraceful LiteLLM restart (${reason})...`);
-  await waitForLiteLLMIdle(60_000);
-  try {
-    execSync("systemctl restart litellm.service", { stdio: "inherit" });
-    await new Promise(resolve => setTimeout(resolve, 3000));
-  } catch (e) {
-    console.error(`LiteLLM restart failed: ${e.message}`);
+    return bindings.sort((a, b) => a.logicalName.localeCompare(b.logicalName)
+      || a.litellmModel.localeCompare(b.litellmModel));
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -1704,9 +1803,10 @@ async function execute(mode, trigger = "manual") {
   const quality = loadQuality();
   const policy = loadPolicy();
 
+  let credentialHealth = null;
   if (mode === "full") {
     try {
-      await refreshCredentialHealth(now);
+      credentialHealth = await refreshCredentialHealth(now);
     } catch {
       console.warn("Credential health: refresh unavailable; model check continues");
     }
@@ -1718,41 +1818,69 @@ async function execute(mode, trigger = "manual") {
     return execute("full", "quick-stale");
   }
 
-  const candidates = mode === "full"
-    ? await buildFullCandidateSet()
-    : buildQuickCandidateSet(previous);
+  let catalog = null;
+  let candidates;
+  if (mode === "full") {
+    const full = await buildFullCandidateSet(readModelCatalogPrevious(MODEL_CATALOG_FILE), now, previous.models || []);
+    candidates = full.candidates;
+    catalog = full.catalog;
+  } else {
+    candidates = buildQuickCandidateSet(previous);
+  }
+  if (mode === "full") {
+    candidates = annotateCandidatesWithCredentialHealth(candidates, credentialHealth, now);
+  }
 
-  let results = await testCandidateSet(candidates, now, prevMap, quality);
+  let results = await testCandidateSet(candidates, now, prevMap, quality, policy, {
+    mode,
+    catalog,
+  });
   const retired = results.filter(r => r.unavailableSince && now - r.unavailableSince > RETIRE_AFTER_MS);
   if (retired.length > 0) {
     console.log(`\nRetiring ${retired.length} model(s) unavailable > 30 days: ${retired.map(r => r.logicalName).join(", ")}`);
   }
   results = results.filter(r => !(r.unavailableSince && now - r.unavailableSince > RETIRE_AFTER_MS));
-  const added = [];
-  const needsRestartForNewModels = [];
-
-  if (mode === "full") {
-    for (const result of results) {
-      if (result.testVia !== "direct" || !result.available) continue;
-      try {
-        if (addToLitellmConfig(result)) {
-          added.push({ logicalName: result.logicalName, latency: result.latency });
-          console.log(`  → Added ${result.logicalName} to LiteLLM config`);
-          const hotAdded = await hotAddModel(result);
-          if (!hotAdded) needsRestartForNewModels.push(result.logicalName);
-        }
-      } catch (e) {
-        console.error(`  Failed to add ${result.logicalName}: ${e.message}`);
-      }
-    }
+  const configuredBindings = parseConfiguredModelBindings(fs.readFileSync(LITELLM_CFG, "utf8"));
+  const runtimeBindings = await fetchRuntimeModelBindings();
+  const activationCandidates = mode === "full"
+    ? results.filter(result => isExplicitCatalogDynamic(result)
+      && result.testVia === "direct"
+      && result.probeSucceededThisRun === true
+      && result.lastTestedAt === now
+      && result.catalogEligibility === "eligible")
+      .map(result => {
+        const policyEntry = lookupModelEntry(policy.models, result) || {};
+        return {
+          ...result,
+          billingApproved: policyEntry.billingApproved === true,
+          billingApprovalProvenance: policyEntry.billingApprovalProvenance || null,
+        };
+      })
+    : [];
+  const activationEvidence = buildActivationEvidence({
+    previousPendingActivation: previous.pendingActivation || [],
+    candidates: activationCandidates,
+    configuredBindings,
+    runtimeBindings,
+    observedAt: now,
+  });
+  if (activationEvidence.pendingActivation.length > 0) {
+    console.log(`Pending model activation (${activationEvidence.pendingActivation.length}); discovery is observation-only`);
   }
-
-  await maybeRestartLiteLLM(needsRestartForNewModels.length > 0, "new model entries (hot-add unavailable)", mode);
+  const activationPending = new Set(activationEvidence.pendingActivation);
+  results = results.map(result => activationPending.has(result.logicalName)
+    ? { ...result, activationPending: true, available: false, error: "activation_pending" }
+    : { ...result, activationPending: false });
+  if (mode === "full" && catalog) {
+    catalog.activationEvidence = activationEvidence;
+    const forbiddenValues = ALLOWED_CREDENTIAL_ENV_NAMES.map(name => env[name]).filter(Boolean);
+    writeModelCatalogAtomic(MODEL_CATALOG_FILE, catalog, forbiddenValues);
+  }
 
   // Run workload-specific probes (full mode only) and compute rating100 for all models
   let workloadScoreMap = new Map();
   if (mode === "full") {
-    workloadScoreMap = await runWorkloadProbesForResults(results, quality);
+    workloadScoreMap = await runWorkloadProbesForResults(results, quality, policy);
     // Reload quality after writes
     const qualityFresh = loadQuality();
     const benchmarks = loadBenchmarks();
@@ -1784,7 +1912,15 @@ async function execute(mode, trigger = "manual") {
     console.log(`  ${capability}: ${models.length > 0 ? models.join(", ") : "(none available)"}`);
   }
 
-  const { heavyChain, fastChain, gpuHeavyFallback, gpuFastFallback } = buildFallbackPlan(ranked);
+  const dynamicBilling = Object.fromEntries(results
+    .filter(result => result.dynamicProvenance === "catalog-auto-v1")
+    .map(result => [result.logicalName, {
+      pricingEvidence: result.pricingEvidence,
+      pricingTier: result.pricingTier,
+      rotationClass: result.rotationClass,
+      autoPromotionPolicy: result.autoPromotionPolicy,
+    }]));
+  const { heavyChain, fastChain, gpuHeavyFallback, gpuFastFallback } = buildFallbackPlan(ranked, dynamicBilling);
 
   const lastFullCheckAt = mode === "full" ? now : (previous.lastFullCheckAt || now);
   const health = {
@@ -1811,7 +1947,17 @@ async function execute(mode, trigger = "manual") {
       probation: Object.values(quality.models || {}).filter(entry => entry.status === "probation").length,
     },
     models: results,
-    newModelsAdded: added,
+    newModelsAdded: [],
+    activationCandidates,
+    activationProposals: activationEvidence.pendingProposals,
+    activationPolicy: activationEvidence.policy,
+    restartRequired: activationEvidence.restartRequired,
+    pendingActivation: activationEvidence.pendingActivation,
+    applyRequired: activationEvidence.applyRequired,
+    applyRequiredNames: activationEvidence.applyRequiredNames,
+    configBindingMismatchNames: activationEvidence.configBindingMismatchNames,
+    runtimeProofAvailable: activationEvidence.runtimeProofAvailable,
+    runtimeBindingMismatchNames: activationEvidence.runtimeBindingMismatchNames,
     fallbacks: {
       editorialCloudHeavy: heavyChain,
       editorialCloudFast: fastChain,
@@ -1828,7 +1974,9 @@ async function execute(mode, trigger = "manual") {
     try {
       const entry = JSON.stringify({
         ts: new Date().toISOString(),
-        newModelsAdded: added.map(m => m.logicalName ?? String(m)),
+        activationCandidates: activationCandidates.map(m => m.logicalName),
+        pendingActivation: activationEvidence.pendingActivation,
+        restartRequired: activationEvidence.restartRequired,
         totalModelCount: results.length,
       });
       let existing = "";
@@ -1847,14 +1995,16 @@ async function execute(mode, trigger = "manual") {
 
   for (const result of results) {
     if (result.provider === "local") continue;
-    const prev = prevMap[result.logicalName];
+    const prev = prevMap.get(result.logicalName);
     if (!prev) continue;
-    if (!prev.available && result.available) changes.push(`🟢 <b>${result.logicalName}</b> back online (${result.latency}ms)`);
+    if (!prev.available && result.available && result.probeSucceededThisRun === true) {
+      changes.push(`🟢 <b>${result.logicalName}</b> back online (${result.latency}ms)`);
+    }
     if (prev.available && !result.available) changes.push(`🔴 <b>${result.logicalName}</b> went offline`);
   }
 
-  for (const addedModel of added) {
-    changes.push(`✨ New model: <code>${addedModel.logicalName}</code> (${addedModel.latency}ms)`);
+  for (const candidate of activationCandidates) {
+    changes.push(`🧪 Activation candidate: <code>${candidate.logicalName}</code> (${candidate.latency}ms; separate approval required)`);
   }
 
   if (totalPrimaryCloud(ranked) === 0) {
@@ -1886,15 +2036,22 @@ async function execute(mode, trigger = "manual") {
   if (missingKeys.length > 0) {
     console.log(`Missing API keys: ${missingKeys.join(", ")} (set in /etc/litellm/litellm.env)`);
   }
-  if (added.length > 0) {
-    console.log(`New models added: ${added.map(entry => entry.logicalName).join(", ")}`);
+  if (activationCandidates.length > 0) {
+    console.log(`Activation candidates: ${activationCandidates.map(entry => entry.logicalName).join(", ")}`);
   }
 }
 
-try {
-  const { mode } = parseArgs(process.argv.slice(2));
-  await execute(mode, "systemd");
-} catch (e) {
-  console.error("model-health-check failed:", e);
-  process.exit(1);
+const healthRunLock = acquireModelHealthRunLock();
+if (!healthRunLock.acquired) {
+  console.log("model-health-check: another health run is active");
+} else {
+  try {
+    const { mode } = parseArgs(process.argv.slice(2));
+    await execute(mode, "systemd");
+  } catch (e) {
+    console.error("model-health-check failed:", e);
+    process.exitCode = 1;
+  } finally {
+    healthRunLock.release();
+  }
 }

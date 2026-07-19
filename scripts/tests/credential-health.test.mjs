@@ -11,6 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { renderLiteLLMModelEntry } from "../model-discovery.mjs";
 
 import {
   ALLOWED_CREDENTIAL_ENV_NAMES,
@@ -18,6 +19,7 @@ import {
   acquireCredentialProbeLock,
   assertCredentialArtifactSafe,
   classifyCredentialResponse,
+  credentialHealthCoversRelevantKeys,
   credentialAdapterNames,
   parseCredentialModelMap,
   probeCredentialHealth,
@@ -63,6 +65,21 @@ test("parses canonical config model-to-key mappings and excludes internal creden
   assert.ok(!credentialAdapterNames().includes("LITELLM_MASTER_KEY"));
 });
 
+test("rendered quoted LiteLLM entries round-trip into credential coverage", () => {
+  const rendered = renderLiteLLMModelEntry({
+    logicalName: "aihubmix-safe-free",
+    provider: "aihubmix",
+    modelId: "coding-safe-free",
+    dynamicProvenance: "catalog-auto-v1",
+    litellmModel: "openai/coding-safe-free",
+    litellmApiBase: "https://aihubmix.com/v1",
+    litellmApiKeyEnv: "AIHUBMIX_API_KEY",
+  });
+  assert.deepEqual(parseCredentialModelMap(`model_list:${rendered}`), {
+    AIHUBMIX_API_KEY: ["aihubmix-safe-free"],
+  });
+});
+
 test("classifies provider responses conservatively", () => {
   assert.equal(classifyCredentialResponse(200, "{}"), "unknown");
   assert.equal(classifyCredentialResponse(200, "{}", true), "valid");
@@ -102,7 +119,9 @@ test("probes once per present configured key and makes no request for a missing 
 
   assert.equal(calls.length, 2);
   assert.equal(calls.every(call => call.options.redirect === "error"), true);
-  assert.equal(calls.some(call => call.url.includes("models.inference.ai.azure.com")), true);
+  assert.equal(calls.some(call => call.url.includes("models.github.ai/inference")), true);
+  const githubCall = calls.find(call => call.url.includes("models.github.ai/inference"));
+  assert.equal(JSON.parse(githubCall.options.body).model, "openai/gpt-4.1");
   assert.equal(calls.some(call => call.url === "https://openrouter.ai/api/v1/key"), true);
   assert.equal(document.credentials.GITHUB_TOKEN.status, "valid");
   assert.equal(document.credentials.OPENROUTER_API_KEY.status, "valid");
@@ -117,6 +136,74 @@ test("probes once per present configured key and makes no request for a missing 
   });
   const serialized = JSON.stringify(document);
   assert.doesNotMatch(serialized, /github-secret-sentinel|openrouter-secret-sentinel/);
+});
+
+test("same environment name is freshly reprobed after an in-place key rotation", async () => {
+  const seenAuthorization = [];
+  const fetchImpl = async (_url, options) => {
+    seenAuthorization.push(options.headers.Authorization);
+    return new Response('{"data":{"label":"ok"}}', { status: 200 });
+  };
+  const configText = `model_list:\n  - model_name: openrouter-safe\n    litellm_params:\n      api_key: os.environ/OPENROUTER_API_KEY\n`;
+  const first = await probeCredentialHealth({
+    configText, env: { OPENROUTER_API_KEY: "rotated-key-one" }, now: 10, fetchImpl,
+  });
+  const second = await probeCredentialHealth({
+    configText, env: { OPENROUTER_API_KEY: "rotated-key-two" }, previous: first, now: 11, fetchImpl,
+  });
+  assert.equal(seenAuthorization.length, 2);
+  assert.notEqual(seenAuthorization[0], seenAuthorization[1]);
+  assert.equal(second.credentials.OPENROUTER_API_KEY.checkedAt, 11);
+  assert.doesNotMatch(JSON.stringify([first, second]), /rotated-key-one|rotated-key-two/);
+});
+
+test("AIHubMix discovery credential is checked before its first model is configured", async () => {
+  const calls = [];
+  const document = await probeCredentialHealth({
+    configText: "model_list: []\n",
+    env: { AIHUBMIX_API_KEY: "aihubmix-secret-sentinel" },
+    now: 1_784_405_050_000,
+    runId: "run-aihubmix",
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      return new Response(JSON.stringify({
+        data: Array.from({ length: 200 }, (_, index) => ({
+          id: `model-${index}`,
+          description: "x".repeat(40),
+        })),
+      }), { status: 200 });
+    },
+  });
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "https://aihubmix.com/v1/models");
+  assert.equal(calls[0].options.redirect, "error");
+  assert.equal(document.credentials.AIHUBMIX_API_KEY.status, "valid");
+  assert.deepEqual(document.credentials.AIHUBMIX_API_KEY.gatesModels, []);
+  assert.doesNotMatch(JSON.stringify(document), /aihubmix-secret-sentinel/);
+});
+
+test("fresh evidence is reusable only when it covers newly relevant discovery keys", () => {
+  const previous = {
+    credentials: {
+      GITHUB_TOKEN: { checkedAt: 100 },
+    },
+  };
+  assert.equal(credentialHealthCoversRelevantKeys(previous, CONFIG, {
+    GITHUB_TOKEN: "github",
+    AIHUBMIX_API_KEY: "new-aihubmix",
+  }), false);
+  previous.credentials.AIHUBMIX_API_KEY = { checkedAt: 101 };
+  assert.equal(credentialHealthCoversRelevantKeys(previous, CONFIG, {
+    GITHUB_TOKEN: "github",
+    AIHUBMIX_API_KEY: "new-aihubmix",
+  }), false, "configured missing keys also need rows");
+  previous.credentials.OPENCODE_GO_API_KEY = { checkedAt: 102 };
+  previous.credentials.OPENROUTER_API_KEY = { checkedAt: 103 };
+  assert.equal(credentialHealthCoversRelevantKeys(previous, CONFIG, {
+    GITHUB_TOKEN: "github",
+    AIHUBMIX_API_KEY: "new-aihubmix",
+  }), true);
 });
 
 test("OpenCode Go uses one direct one-token representative probe", async () => {
