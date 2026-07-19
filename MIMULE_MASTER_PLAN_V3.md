@@ -2433,3 +2433,19 @@ NEXT:
 - Operator: rotate AIHUBMIX_API_KEY (pasted in chat).
 - Implement Slice 0 raw-OpenCode containment: bind the raw upstream to loopback, remove or authenticate the public raw route, verify the firewall, migrate the inline provider secrets to a root-owned 0600 EnvironmentFile, and hand off leak-free credential rotation.
 - After Slice 0 acceptance, write bounded Slice 1/2 specs (Shape defaults confirmed).
+### 2026-07-19 08:35 UTC - Claude Fable
+
+STATUS:
+- Slice 0 raw OpenCode upstream containment IMPLEMENTED and accepted against its external + loopback gate. Operator granted the one-shot authorization. An independent Claude Sonnet 5 review found no unauthenticated-access gap. Credential rotation is handed to the operator (only they can mint provider keys).
+
+CHANGES:
+- Bound the raw upstream to loopback, closed its public raw reverse-proxy routes (the authenticated Control Surface proxy path is unchanged), moved its provider secrets to a root-owned 0600 EnvironmentFile, and added a defense-in-depth firewall deny. Every edited file was backed up with rollback ready; secret values were migrated by a non-echoing script and never printed.
+- No application code changed - only host service, reverse-proxy, and firewall configuration.
+
+EVIDENCE:
+- Listener is loopback-only; service active; unit contains zero inline secret directives; secret file is 0600 root. Previously-open external raw routes no longer return raw upstream data (404 / authenticated SPA), while the authenticated proxy still returns 401 unauthenticated and the internal loopback health check still succeeds.
+- Independent read-only adversarial review (Claude Sonnet 5): no P0/P1. Residual items are operator credential rotation and an optional CF-dashboard cleanup. Exact coordinates and the rotation runbook are held only in the private AI Vault.
+
+NEXT:
+- Operator: rotate the previously-exposed provider credentials (some are shared with LiteLLM - coordinate that restart with the repair-arc gate) and, when next in the Cloudflare dashboard, remove the now-404 public hostname and its DNS record.
+- Do NOT claim internal test sessions are permanently hidden yet: that requires Slice 1 (durable ownership-aware registry + server-side visibility invariant), the next build slice, delegated to Codex Terra/Luna or Sonnet 5.
