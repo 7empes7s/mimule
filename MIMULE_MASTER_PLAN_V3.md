@@ -2416,3 +2416,20 @@ NEXT:
 - Let the existing 08:05 UTC full-health timer create the first live catalog artifact; inspect only sanitized counts, credential categories, proposals, config hashes, and service identity. Do not activate a proposal without the separate apply path.
 - Rotate the AIHubMix credential because it was pasted into chat.
 - Obtain explicit operator confirmation of the Agent Workspace Shape defaults and separate one-shot authorization for raw OpenCode Slice 0 containment before claiming internal test sessions are permanently hidden.
+### 2026-07-19 08:10 UTC - Claude Fable
+
+STATUS:
+- First natural full model-health scan under 4007b3f observed passively at 08:05 UTC: clean, observation-only, zero activation. Operator confirmed all 12 Agent Workspace Shape defaults and authorized raw-OpenCode Slice 0 containment (full one-shot).
+
+CHANGES:
+- No code/config/service change. Appended scan evidence to SPEC 49 (new section 12), the routing repair plan (new section 15), this plan, and the AI Vault. Captured pre/post config-hash and service-identity baselines only.
+
+EVIDENCE:
+- model-health-check.timer `--mode=full` fired 08:05:05 UTC, exit 0. model-catalog.json schema v1 / bounded-provider-inventory-v1 / runId 9e7c4396-fc1d-4268-afaf-35db20055fc0; all 11 providers complete=True, carriedForward=False. Drift: openrouter 344->334, cloudflare -6.
+- Routing-config SHA-256 unchanged (0c9f7764...e093 / 922a5914...a79). LiteLLM PID 2137446, NRestarts=0 unchanged. AIHubMix credential valid but gatesModels=0 -> no route wired.
+- Credentials: 9 valid, 2 rate_limited (NVIDIA 429, OpenCode Zen 429). GitHub recovered rate_limited->valid; Cloudflare/Groq resolved unknown->valid.
+
+NEXT:
+- Operator: rotate AIHUBMIX_API_KEY (pasted in chat).
+- Implement Slice 0 raw-OpenCode containment: bind the raw upstream to loopback, remove or authenticate the public raw route, verify the firewall, migrate the inline provider secrets to a root-owned 0600 EnvironmentFile, and hand off leak-free credential rotation.
+- After Slice 0 acceptance, write bounded Slice 1/2 specs (Shape defaults confirmed).
